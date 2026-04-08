@@ -21,6 +21,7 @@ class LogType(Enum):
     THINKING = "💭 THINKING"
     TOOL_CALL = "🔧 TOOL_CALL"
     TOOL_RESULT = "📦 TOOL_RESULT"
+    TOOL_CALL_REASON = "📝 TOOL_CALL_REASON"
     RESPONSE = "💬 RESPONSE"
     SYSTEM = "⚙️ SYSTEM"
     ERROR = "❌ ERROR"

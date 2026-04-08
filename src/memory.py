@@ -36,6 +36,7 @@ class Memory:
         self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
+                user_id TEXT,
                 created_at REAL,
                 updated_at REAL,
                 context_window INTEGER DEFAULT 128000
@@ -44,6 +45,7 @@ class Memory:
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT,
+                user_id TEXT,
                 role TEXT,
                 content TEXT,
                 tool_calls TEXT,
@@ -55,6 +57,7 @@ class Memory:
             CREATE TABLE IF NOT EXISTS summaries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT,
+                user_id TEXT,
                 summary TEXT,
                 message_range_start INTEGER,
                 message_range_end INTEGER,
@@ -65,6 +68,7 @@ class Memory:
             CREATE TABLE IF NOT EXISTS message_index (
                 message_id INTEGER PRIMARY KEY,
                 session_id TEXT,
+                user_id TEXT,
                 keywords TEXT,
                 chunk_index INTEGER,
                 FOREIGN KEY (message_id) REFERENCES messages(id)
@@ -74,17 +78,26 @@ class Memory:
 
     # ─── 会话管理 ───
 
-    def create_session(self, session_id: str, context_window: int = 128000):
+    def create_session(self, session_id: str, context_window: int = 128000, user_id: str = "default_user"):
         now = time.time()
         self.conn.execute(
-            "INSERT OR IGNORE INTO sessions (session_id, created_at, updated_at, context_window) VALUES (?, ?, ?, ?)",
-            (session_id, now, now, context_window)
+            "INSERT OR IGNORE INTO sessions (session_id, user_id, created_at, updated_at, context_window) VALUES (?, ?, ?, ?, ?)",
+            (session_id, user_id, now, now, context_window)
         )
         self.conn.commit()
         self._current_session = session_id
 
     def get_current_session(self) -> Optional[str]:
         return self._current_session
+
+    def get_user_id(self, session_id: str) -> str:
+        """从 session_id 获取 user_id"""
+        cursor = self.conn.execute(
+            "SELECT user_id FROM sessions WHERE session_id = ?",
+            (session_id,)
+        )
+        result = cursor.fetchone()
+        return result[0] if result else "default_user"
 
     def touch_session(self, session_id: str):
         self.conn.execute(
@@ -100,9 +113,10 @@ class Memory:
                     tool_call_id: Optional[str] = None):
         now = time.time()
         tc_json = json.dumps(tool_calls) if tool_calls else None
+        user_id = self.get_user_id(session_id)
         cursor = self.conn.execute(
-            "INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-            (session_id, role, content, tc_json, tool_call_id, now)
+            "INSERT INTO messages (session_id, user_id, role, content, tool_calls, tool_call_id, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (session_id, user_id, role, content, tc_json, tool_call_id, now)
         )
         msg_id = cursor.lastrowid
 
@@ -115,6 +129,7 @@ class Memory:
 
     def _index_message(self, msg_id: int, session_id: str, content: str):
         """为消息建立关键词索引"""
+        user_id = self.get_user_id(session_id)
         # 简单分词：按标点和空格切分，保留有意义的词
         import re
         words = re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z]+|\d+(?:\.\d+)?', content.lower())
@@ -123,27 +138,29 @@ class Memory:
         if keywords:
             keywords_str = "|".join(keywords[:50])  # 最多50个关键词
             self.conn.execute(
-                "INSERT OR REPLACE INTO message_index (message_id, session_id, keywords) VALUES (?, ?, ?)",
-                (msg_id, session_id, keywords_str)
+                "INSERT OR REPLACE INTO message_index (message_id, session_id, user_id, keywords) VALUES (?, ?, ?, ?)",
+                (msg_id, session_id, user_id, keywords_str)
             )
 
     def get_all_messages(self, session_id: str) -> List[Dict]:
         """获取全量消息"""
+        user_id = self.get_user_id(session_id)
         rows = self.conn.execute(
-            "SELECT role, content, tool_calls, tool_call_id FROM messages WHERE session_id = ? ORDER BY id ASC",
-            (session_id,)
+            "SELECT role, content, tool_calls, tool_call_id FROM messages WHERE session_id = ? AND user_id = ? ORDER BY id ASC",
+            (session_id, user_id)
         ).fetchall()
         return self._rows_to_messages(rows)
 
     def get_recent_messages(self, session_id: str, keep_ratio: float = None) -> List[Dict]:
         """获取最近一部分消息"""
+        user_id = self.get_user_id(session_id)
         ratio = keep_ratio or self.config.keep_ratio
         total = self.get_message_count(session_id)
         keep_count = max(int(total * ratio), 6)
 
         rows = self.conn.execute(
-            "SELECT role, content, tool_calls, tool_call_id FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
-            (session_id, keep_count)
+            "SELECT role, content, tool_calls, tool_call_id FROM messages WHERE session_id = ? AND user_id = ? ORDER BY id DESC LIMIT ?",
+            (session_id, user_id, keep_count)
         ).fetchall()
         rows.reverse()
         return self._rows_to_messages(rows)
@@ -160,9 +177,10 @@ class Memory:
         return messages
 
     def get_message_count(self, session_id: str) -> int:
+        user_id = self.get_user_id(session_id)
         row = self.conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ?",
-            (session_id,)
+            "SELECT COUNT(*) FROM messages WHERE session_id = ? AND user_id = ?",
+            (session_id, user_id)
         ).fetchone()
         return row[0]
 
@@ -190,6 +208,10 @@ class Memory:
         return estimated / context_window > self.config.compress_threshold
 
     def should_compress_idle(self, session_id: str) -> bool:
+        # 如果 idle_compress_hours <= 0，则不进行闲置压缩
+        if self.config.idle_compress_hours <= 0:
+            return False
+
         if self.has_been_compressed(session_id):
             return False
         row = self.conn.execute(
@@ -202,9 +224,10 @@ class Memory:
         return idle_hours >= self.config.idle_compress_hours and self.get_message_count(session_id) > 0
 
     def has_been_compressed(self, session_id: str) -> bool:
+        user_id = self.get_user_id(session_id)
         row = self.conn.execute(
-            "SELECT COUNT(*) FROM summaries WHERE session_id = ?",
-            (session_id,)
+            "SELECT COUNT(*) FROM summaries WHERE session_id = ? AND user_id = ?",
+            (session_id, user_id)
         ).fetchone()
         return row[0] > 0
 
@@ -230,9 +253,10 @@ class Memory:
 
         # 保存摘要
         now = time.time()
+        user_id = self.get_user_id(session_id)
         self.conn.execute(
-            "INSERT INTO summaries (session_id, summary, message_range_start, message_range_end, timestamp) VALUES (?, ?, ?, ?, ?)",
-            (session_id, summary, 1, total - keep_count, now)
+            "INSERT INTO summaries (session_id, user_id, summary, message_range_start, message_range_end, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, user_id, summary, 1, total - keep_count, now)
         )
         self.conn.commit()
 
@@ -256,12 +280,13 @@ class Memory:
 
     def get_context_for_llm(self, session_id: str) -> List[Dict]:
         """获取上下文：摘要 + 最近消息"""
+        user_id = self.get_user_id(session_id)
         messages = []
 
         # 最新摘要
         summary_row = self.conn.execute(
-            "SELECT summary FROM summaries WHERE session_id = ? ORDER BY id DESC LIMIT 1",
-            (session_id,)
+            "SELECT summary FROM summaries WHERE session_id = ? AND user_id = ? ORDER BY id DESC LIMIT 1",
+            (session_id, user_id)
         ).fetchone()
         if summary_row:
             messages.append({
@@ -277,6 +302,7 @@ class Memory:
 
     def search_messages(self, session_id: str, query: str, top_k: int = None) -> List[Dict]:
         """关键词检索历史消息"""
+        user_id = self.get_user_id(session_id)
         k = top_k or self.config.rag_top_k
 
         import re
@@ -288,7 +314,7 @@ class Memory:
 
         # 构造 LIKE 查询
         conditions = []
-        params = [session_id]
+        params = [session_id, user_id]
         for word in query_words:
             conditions.append("mi.keywords LIKE ?")
             params.append(f"%{word}%")
@@ -299,7 +325,7 @@ class Memory:
             SELECT m.id, m.role, m.content, m.timestamp, mi.keywords
             FROM messages m
             JOIN message_index mi ON m.id = mi.message_id
-            WHERE m.session_id = ? AND ({where})
+            WHERE m.session_id = ? AND m.user_id = ? AND ({where})
             ORDER BY m.id DESC
             LIMIT ?
         """
@@ -363,9 +389,10 @@ class Memory:
     # ─── 会话管理 ───
 
     def clear_session(self, session_id: str):
-        self.conn.execute("DELETE FROM message_index WHERE session_id = ?", (session_id,))
-        self.conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-        self.conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
+        user_id = self.get_user_id(session_id)
+        self.conn.execute("DELETE FROM message_index WHERE session_id = ? AND user_id = ?", (session_id, user_id))
+        self.conn.execute("DELETE FROM messages WHERE session_id = ? AND user_id = ?", (session_id, user_id))
+        self.conn.execute("DELETE FROM summaries WHERE session_id = ? AND user_id = ?", (session_id, user_id))
         self.conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
         self.conn.commit()
 

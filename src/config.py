@@ -24,6 +24,8 @@ DEFAULT_CONFIG = {
     "idle_compress_hours": 6,
     "debug": False,
     "colorize": True,
+    "user_id": "default_user",
+    "session_id": "",
 }
 
 

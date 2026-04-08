@@ -177,17 +177,73 @@ class OpenAICompatibleLLM(BaseLLM):
         if tools:
             payload["tools"] = tools
 
-        response = requests.post(
-            f"{self.base_url}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=120
-        )
-        response.raise_for_status()
-        data = response.json()
-        return self._parse_response(data)
+        try:
+            response = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=120
+            )
+            response.raise_for_status()
+            data = response.json()
+            return self._parse_response(data)
+        except requests.exceptions.HTTPError as e:
+            # 获取详细的错误信息
+            error_detail = ""
+            try:
+                error_data = response.json()
+                error_detail = json.dumps(error_data, ensure_ascii=False)
+            except:
+                error_detail = response.text if hasattr(response, 'text') else str(e)
+
+            # 构建详细的错误信息
+            error_msg = f"HTTP {response.status_code}: {response.reason}\n错误详情: {error_detail}"
+
+            # 返回包含错误信息的响应
+            return LLMResponse(
+                content="",
+                tool_calls=None,
+                usage=None,
+                raw={
+                    "error": True,
+                    "status_code": response.status_code,
+                    "reason": response.reason,
+                    "error_detail": error_detail,
+                    "error_message": error_msg
+                }
+            )
 
     def _parse_response(self, data: Dict) -> LLMResponse:
+        # 检查是否有错误
+        if "error" in data:
+            error_detail = json.dumps(data["error"], ensure_ascii=False)
+            error_msg = f"API 错误: {error_detail}"
+
+            return LLMResponse(
+                content="",
+                tool_calls=None,
+                usage=None,
+                raw={
+                    "error": True,
+                    "error_detail": error_detail,
+                    "error_message": error_msg
+                }
+            )
+
+        # 检查是否有 choices
+        if "choices" not in data or not data["choices"]:
+            error_msg = "API 返回了空的 choices"
+            return LLMResponse(
+                content="",
+                tool_calls=None,
+                usage=None,
+                raw={
+                    "error": True,
+                    "error_message": error_msg,
+                    "response_data": data
+                }
+            )
+
         choice = data["choices"][0]["message"]
         content = choice.get("content", "") or ""
 

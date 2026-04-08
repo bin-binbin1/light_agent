@@ -3,6 +3,7 @@ Agent 模块 - 对话管理核心
 封装 Agent 的创建、记忆、工具调用
 """
 
+import json
 import uuid
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass, field
@@ -11,7 +12,7 @@ from .llm import BaseLLM, Message, LLMResponse
 from .memory import Memory, MemoryConfig
 from .tools import ToolRegistry, create_default_tools
 from .prompt import PromptManager
-from .logging import Logger, default_logger
+from .logging import Logger, default_logger, LogType
 
 
 @dataclass
@@ -23,6 +24,9 @@ class AgentConfig:
     temperature: float = 0.7
     max_tokens: int = 4096
     memory_config: MemoryConfig = field(default_factory=MemoryConfig)
+    debug: bool = False
+    user_id: str = "default_user"
+    session_id: str = ""
 
 
 class Agent:
@@ -37,10 +41,16 @@ class Agent:
         self.logger = logger or default_logger
         self.prompt_mgr = PromptManager(self.config.system_prompt or PromptManager().system_prompt)
         self.memory = Memory(self.config.memory_config, llm=llm)
-        self.session_id = str(uuid.uuid4())[:8]
+
+        # 使用配置中的 session_id，如果没有则基于 user_id 生成
+        if self.config.session_id:
+            self.session_id = self.config.session_id
+        else:
+            # 为每个用户生成独立的会话ID
+            self.session_id = f"{self.config.user_id}_{str(uuid.uuid4())[:8]}"
 
         # 初始化会话
-        self.memory.create_session(self.session_id, self.config.context_window)
+        self.memory.create_session(self.session_id, self.config.context_window, self.config.user_id)
 
         # 工具注册（传入 memory 以支持记忆检索）
         self.tools = tools or create_default_tools(memory=self.memory)
@@ -85,18 +95,27 @@ class Agent:
 
         return response.content
 
-    def _build_messages(self) -> List[Dict]:
+    def _build_messages(self) -> List[Message]:
         """构建发送给 LLM 的消息列表"""
+        from .llm import Message
+
         # 系统提示词（含工具描述）
         tools_desc = self.prompt_mgr.format_tool_descriptions(
             self.tools.to_openai_format()
         )
         system_msg = self.prompt_mgr.build_system_message(tools_desc)
 
-        messages = [{"role": "system", "content": system_msg}]
+        messages = [Message(role="system", content=system_msg)]
 
         # 添加记忆上下文
-        messages.extend(self.memory.get_context_for_llm(self.session_id))
+        context_messages = self.memory.get_context_for_llm(self.session_id)
+        for msg in context_messages:
+            messages.append(Message(
+                role=msg.get("role", "user"),
+                content=msg.get("content", ""),
+                tool_calls=msg.get("tool_calls"),
+                tool_call_id=msg.get("tool_call_id")
+            ))
 
         return messages
 
@@ -104,17 +123,18 @@ class Agent:
         """处理工具调用循环"""
         # 保存 assistant 的 tool_calls 消息
         tc_dicts = [
-            {"id": tc.id, "type": "function", "function": {"name": tc.name, "arguments": str(tc.arguments)}}
+            {"id": tc.id, "type": "function", "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)}}
             for tc in response.tool_calls
         ]
         self.memory.add_message(self.session_id, "assistant", response.content or "", tool_calls=tc_dicts)
 
+        if self.config.debug:
+            self.logger.log(LogType.TOOL_CALL_REASON, f"tool_call_reason: {response.content}")
         # 执行每个工具
         for tc in response.tool_calls:
             self.logger.tool_call(tc.name, str(tc.arguments))
             result = self.tools.execute(tc.name, tc.arguments)
             self.logger.tool_result(tc.name, result)
-
             # 添加工具结果到记忆
             self.memory.add_message(self.session_id, "tool", result, tool_call_id=tc.id)
 
@@ -129,6 +149,17 @@ class Agent:
             max_tokens=self.config.max_tokens
         )
 
+        # 检查是否有错误
+        if final_response.raw and final_response.raw.get("error"):
+            error_msg = final_response.raw.get("error_message", "未知错误")
+            self.logger.error(f"工具调用后 LLM 返回错误: {error_msg}")
+
+            # 在 debug 模式下输出详细错误信息
+            if self.config.debug:
+                error_detail = final_response.raw.get("error_detail", "")
+                if error_detail:
+                    self.logger.error(f"详细错误: {error_detail}")
+
         # 如果还有工具调用，递归处理
         if final_response.tool_calls:
             return self._handle_tool_calls(final_response)
@@ -141,8 +172,9 @@ class Agent:
     def reset(self):
         """重置对话"""
         self.memory.clear_session(self.session_id)
-        self.session_id = str(uuid.uuid4())[:8]
-        self.memory.create_session(self.session_id, self.config.context_window)
+        # 为每个用户生成独立的会话ID
+        self.session_id = f"{self.config.user_id}_{str(uuid.uuid4())[:8]}"
+        self.memory.create_session(self.session_id, self.config.context_window, self.config.user_id)
         self.logger.system(f"对话已重置, 新 session={self.session_id}")
 
     def get_history(self) -> List[Dict]:
