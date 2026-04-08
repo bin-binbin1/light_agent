@@ -1,0 +1,150 @@
+"""
+Agent 模块 - 对话管理核心
+封装 Agent 的创建、记忆、工具调用
+"""
+
+import uuid
+from typing import List, Dict, Optional, Any
+from dataclasses import dataclass, field
+
+from .llm import BaseLLM, Message, LLMResponse
+from .memory import Memory, MemoryConfig
+from .tools import ToolRegistry, create_default_tools
+from .prompt import PromptManager
+from .logging import Logger, default_logger
+
+
+@dataclass
+class AgentConfig:
+    """Agent 配置"""
+    name: str = "agent"
+    system_prompt: str = ""
+    context_window: int = 128000
+    temperature: float = 0.7
+    max_tokens: int = 4096
+    memory_config: MemoryConfig = field(default_factory=MemoryConfig)
+
+
+class Agent:
+    """对话 Agent"""
+
+    def __init__(self, llm: BaseLLM, config: Optional[AgentConfig] = None,
+                 tools: Optional[ToolRegistry] = None,
+                 logger: Optional[Logger] = None):
+        self.llm = llm
+        self.config = config or AgentConfig()
+        self.tools = tools or create_default_tools()
+        self.logger = logger or default_logger
+        self.prompt_mgr = PromptManager(self.config.system_prompt or PromptManager().system_prompt)
+        self.memory = Memory(self.config.memory_config, llm=llm)
+        self.session_id = str(uuid.uuid4())[:8]
+
+        # 初始化会话
+        self.memory.create_session(self.session_id, self.config.context_window)
+
+        # 工具注册（传入 memory 以支持记忆检索）
+        self.tools = tools or create_default_tools(memory=self.memory)
+        self.logger.system(f"Agent '{self.config.name}' 已创建, session={self.session_id}")
+
+    def chat(self, user_input: str) -> str:
+        """单轮对话"""
+        # 添加用户消息
+        self.memory.add_message(self.session_id, "user", user_input)
+        self.memory.touch_session(self.session_id)
+        self.logger.system(f"收到用户消息: {user_input[:100]}")
+
+        # 检查是否需要压缩（上下文超限 或 闲置太久且未压缩过）
+        if self.memory.should_compress(self.session_id):
+            self.logger.compress("上下文即将超限，启动记忆压缩...")
+            self.memory.compress(self.session_id)
+            self.logger.compress("压缩完成")
+        elif self.memory.should_compress_idle(self.session_id):
+            self.logger.compress(f"闲置超过{self.config.memory_config.idle_compress_hours}h且未压缩过，启动记忆压缩...")
+            self.memory.compress(self.session_id)
+            self.logger.compress("压缩完成")
+
+        # 构建消息
+        messages = self._build_messages()
+        tools = self.tools.to_openai_format() or None
+
+        # 调用 LLM
+        response = self.llm.chat(
+            messages=messages,
+            tools=tools,
+            temperature=self.config.temperature,
+            max_tokens=self.config.max_tokens
+        )
+
+        # 处理工具调用
+        if response.tool_calls:
+            return self._handle_tool_calls(response)
+
+        # 保存回复
+        self.memory.add_message(self.session_id, "assistant", response.content)
+        self.logger.response(response.content)
+
+        return response.content
+
+    def _build_messages(self) -> List[Dict]:
+        """构建发送给 LLM 的消息列表"""
+        # 系统提示词（含工具描述）
+        tools_desc = self.prompt_mgr.format_tool_descriptions(
+            self.tools.to_openai_format()
+        )
+        system_msg = self.prompt_mgr.build_system_message(tools_desc)
+
+        messages = [{"role": "system", "content": system_msg}]
+
+        # 添加记忆上下文
+        messages.extend(self.memory.get_context_for_llm(self.session_id))
+
+        return messages
+
+    def _handle_tool_calls(self, response: LLMResponse) -> str:
+        """处理工具调用循环"""
+        # 保存 assistant 的 tool_calls 消息
+        tc_dicts = [
+            {"id": tc.id, "type": "function", "function": {"name": tc.name, "arguments": str(tc.arguments)}}
+            for tc in response.tool_calls
+        ]
+        self.memory.add_message(self.session_id, "assistant", response.content or "", tool_calls=tc_dicts)
+
+        # 执行每个工具
+        for tc in response.tool_calls:
+            self.logger.tool_call(tc.name, str(tc.arguments))
+            result = self.tools.execute(tc.name, tc.arguments)
+            self.logger.tool_result(tc.name, result)
+
+            # 添加工具结果到记忆
+            self.memory.add_message(self.session_id, "tool", result, tool_call_id=tc.id)
+
+        # 重新调用 LLM 获取最终回复
+        messages = self._build_messages()
+        tools = self.tools.to_openai_format() or None
+
+        final_response = self.llm.chat(
+            messages=messages,
+            tools=tools,
+            temperature=self.config.temperature,
+            max_tokens=self.config.max_tokens
+        )
+
+        # 如果还有工具调用，递归处理
+        if final_response.tool_calls:
+            return self._handle_tool_calls(final_response)
+
+        self.memory.add_message(self.session_id, "assistant", final_response.content)
+        self.logger.response(final_response.content)
+
+        return final_response.content
+
+    def reset(self):
+        """重置对话"""
+        self.memory.clear_session(self.session_id)
+        self.session_id = str(uuid.uuid4())[:8]
+        self.memory.create_session(self.session_id, self.config.context_window)
+        self.logger.system(f"对话已重置, 新 session={self.session_id}")
+
+    def get_history(self) -> List[Dict]:
+        """获取对话历史"""
+        return self.memory.get_messages(self.session_id)
