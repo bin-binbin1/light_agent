@@ -51,6 +51,7 @@ class Logger:
 
     def __init__(self, config: Optional[LogConfig] = None):
         self.config = config or LogConfig()
+        self.disabled_types: set = set()  # 被禁用的 LogType 集合
 
     def _format(self, log_type: LogType, message: str, level: LogLevel = LogLevel.INFO) -> str:
         parts = []
@@ -73,7 +74,17 @@ class Logger:
 
         return " | ".join(parts)
 
+    def disable(self, *log_types: LogType):
+        """禁用指定类型的日志输出"""
+        self.disabled_types.update(log_types)
+
+    def enable(self, *log_types: LogType):
+        """重新启用指定类型的日志输出"""
+        self.disabled_types.difference_update(log_types)
+
     def log(self, log_type: LogType, message: str, level: LogLevel = LogLevel.INFO):
+        if log_type in self.disabled_types:
+            return
         if level.value >= self.config.level.value:
             print(self._format(log_type, message, level), file=sys.stderr)
 

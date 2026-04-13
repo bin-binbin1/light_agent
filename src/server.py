@@ -6,6 +6,8 @@ Server 模块 - HTTP 服务接口
 import json
 import os
 import time
+import threading
+from collections import OrderedDict
 from typing import Optional
 
 try:
@@ -21,6 +23,41 @@ from .llm import LLMFactory, LLMType, Message
 from .tools import create_default_tools
 from .logging import Logger, LogConfig, LogLevel
 from .config import Config
+
+
+class LRUAgentCache:
+    """线程安全的 LRU Agent 缓存，淘汰时自动释放资源"""
+
+    def __init__(self, max_size: int = 500):
+        self._cache: OrderedDict = OrderedDict()
+        self._lock = threading.Lock()
+        self._max_size = max_size
+
+    def get(self, key: str) -> Optional[Agent]:
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return self._cache[key]
+            return None
+
+    def put(self, key: str, agent: Agent):
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                self._cache[key] = agent
+            else:
+                if len(self._cache) >= self._max_size:
+                    _, evicted = self._cache.popitem(last=False)
+                    self._cleanup(evicted)
+                self._cache[key] = agent
+
+    def _cleanup(self, agent: Agent):
+        """释放被淘汰 Agent 持有的资源"""
+        try:
+            if hasattr(agent, 'memory') and hasattr(agent.memory, 'close'):
+                agent.memory.close()
+        except Exception:
+            pass
 
 
 def create_app(config_path: str = "config/config.json") -> Flask:
@@ -44,12 +81,13 @@ def create_app(config_path: str = "config/config.json") -> Flask:
         idle_compress_hours=config.idle_compress_hours,
     )
 
-    # Agent 缓存
-    _agent_cache = {}
+    # Agent LRU 缓存（线程安全，淘汰时自动释放资源）
+    _agent_cache = LRUAgentCache(max_size=config.get("agent_cache_size", 500))
 
     def get_agent(user_id: str, session_id: str) -> Agent:
         cache_key = f"{user_id}:{session_id}"
-        if cache_key not in _agent_cache:
+        agent = _agent_cache.get(cache_key)
+        if agent is None:
             llm = LLMFactory.create(config.provider, config.api_key, config.model or None)
             mem = sm.get_memory(user_id, session_id, llm=llm)
             agent_config = AgentConfig(
@@ -62,8 +100,8 @@ def create_app(config_path: str = "config/config.json") -> Flask:
             agent = Agent(llm, agent_config, tools=create_default_tools(memory=mem), logger=logger)
             agent.memory = mem
             agent.session_id = session_id
-            _agent_cache[cache_key] = agent
-        return _agent_cache[cache_key]
+            _agent_cache.put(cache_key, agent)
+        return agent
 
     # ─── API 路由 ───
 
@@ -228,18 +266,40 @@ def create_app(config_path: str = "config/config.json") -> Flask:
 
 
 def run_server(host: str = "0.0.0.0", port: int = 8000, config_path: str = "config/config.json",
-               debug: bool = False):
-    """启动服务"""
+               debug: bool = False, workers: int = 4, server: str = "auto"):
+    """启动服务
+
+    Args:
+        server: "auto" 自动检测最佳服务器, "waitress" 强制用 waitress, "flask" 用开发服务器
+    """
     app = create_app(config_path)
-    print(f"🚀 Light Agent Server 启动: http://{host}:{port}")
-    print(f"   API 文档:")
+    print(f"Light Agent Server: http://{host}:{port}")
     print(f"   POST /api/chat          - 对话")
     print(f"   POST /api/chat/stream   - 流式对话")
     print(f"   POST /api/sessions      - 创建会话")
     print(f"   POST /api/users         - 创建用户")
     print(f"   POST /api/search        - 搜索记忆")
     print(f"   GET  /api/health        - 健康检查")
-    app.run(host=host, port=port, debug=debug)
+
+    # 自动选择服务器
+    if server == "auto":
+        if debug:
+            server = "flask"
+        else:
+            try:
+                import waitress  # noqa: F401
+                server = "waitress"
+            except ImportError:
+                server = "flask"
+
+    if server == "waitress":
+        import waitress
+        print(f"   Server: waitress ({workers} threads)")
+        waitress.serve(app, host=host, port=port, threads=workers)
+    else:
+        if not debug:
+            print("   WARNING: Flask 开发服务器不适合生产环境，请安装 waitress: pip install waitress")
+        app.run(host=host, port=port, debug=debug)
 
 
 if __name__ == "__main__":

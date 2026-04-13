@@ -54,6 +54,8 @@ class Agent:
 
         # 工具注册（传入 memory 以支持记忆检索）
         self.tools = tools or create_default_tools(memory=self.memory)
+        # 注入 agent 上下文，工具函数声明了对应参数则自动收到
+        self.tools.set_context(user_id=self.config.user_id)
         self.logger.system(f"Agent '{self.config.name}' 已创建, session={self.session_id}")
 
     def chat(self, user_input: str) -> str:

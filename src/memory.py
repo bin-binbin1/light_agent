@@ -405,5 +405,13 @@ class Memory:
             for r in rows
         ]
 
+    def get_latest_session(self, user_id: str) -> Optional[str]:
+        """获取用户最近活跃的 session_id"""
+        row = self.conn.execute(
+            "SELECT session_id FROM sessions WHERE user_id = ? ORDER BY updated_at DESC LIMIT 1",
+            (user_id,)
+        ).fetchone()
+        return row[0] if row else None
+
     def close(self):
         self.conn.close()
