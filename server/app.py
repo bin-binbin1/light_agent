@@ -1,6 +1,6 @@
 """
-Server 模块 - HTTP 服务接口
-基于 Flask，轻量级 API 服务
+App 模块 - Flask HTTP 服务
+Agent 对话 API + Web UI 静态文件 + OpenAI 中转代理
 """
 
 import json
@@ -11,18 +11,18 @@ from collections import OrderedDict
 from typing import Optional
 
 try:
-    from flask import Flask, request, jsonify, Response, stream_with_context
+    from flask import Flask, request, jsonify, Response, stream_with_context, send_from_directory
     HAS_FLASK = True
 except ImportError:
     HAS_FLASK = False
 
-from .session import SessionManager
-from .agent import Agent, AgentConfig
-from .memory import MemoryConfig
-from .llm import LLMFactory, LLMType, Message
-from .tools import create_default_tools
-from .logging import Logger, LogConfig, LogLevel
-from .config import Config
+from src.session import SessionManager
+from src.agent import Agent, AgentConfig
+from src.memory import MemoryConfig
+from src.llm import LLMFactory, LLMType, Message
+from src.tools import create_default_tools
+from src.logging import Logger, LogConfig, LogLevel
+from src.config import Config
 
 
 class LRUAgentCache:
@@ -68,6 +68,9 @@ def create_app(config_path: str = "config/config.json") -> Flask:
     app = Flask(__name__)
     config = Config(config_path)
 
+    # Web UI 静态文件目录
+    web_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
+
     # 初始化
     log_config = LogConfig(
         level=LogLevel.DEBUG if config.get("debug") else LogLevel.INFO
@@ -81,7 +84,7 @@ def create_app(config_path: str = "config/config.json") -> Flask:
         idle_compress_hours=config.idle_compress_hours,
     )
 
-    # Agent LRU 缓存（线程安全，淘汰时自动释放资源）
+    # Agent LRU 缓存
     _agent_cache = LRUAgentCache(max_size=config.get("agent_cache_size", 500))
 
     def get_agent(user_id: str, session_id: str) -> Agent:
@@ -103,7 +106,17 @@ def create_app(config_path: str = "config/config.json") -> Flask:
             _agent_cache.put(cache_key, agent)
         return agent
 
-    # ─── API 路由 ───
+    # ─── Web UI 静态文件 ───
+
+    @app.route("/")
+    def index():
+        return send_from_directory(web_dir, "index.html")
+
+    @app.route("/<path:filename>")
+    def static_files(filename):
+        return send_from_directory(web_dir, filename)
+
+    # ─── 健康检查 ───
 
     @app.route("/api/health", methods=["GET"])
     def health():
@@ -178,7 +191,6 @@ def create_app(config_path: str = "config/config.json") -> Flask:
         if not user_id or not session_id or not message:
             return jsonify({"error": "user_id, session_id, message required"}), 400
 
-        # 确保会话存在
         if not sm.get_session(session_id, user_id):
             sm.create_session(user_id, session_id=session_id)
 
@@ -192,7 +204,7 @@ def create_app(config_path: str = "config/config.json") -> Flask:
 
     @app.route("/api/chat/stream", methods=["POST"])
     def chat_stream():
-        """流式输出（如果模型支持）"""
+        """流式输出"""
         data = request.json or {}
         user_id = data.get("user_id")
         session_id = data.get("session_id")
@@ -207,10 +219,8 @@ def create_app(config_path: str = "config/config.json") -> Flask:
         def generate():
             try:
                 agent = get_agent(user_id, session_id)
-                # 目前先返回完整响应，后续实现真正的流式
                 response = agent.chat(message)
                 sm.touch_session(session_id)
-                # 按字符模拟流式
                 for char in response:
                     yield f"data: {json.dumps({'content': char})}\n\n"
                 yield f"data: {json.dumps({'done': True})}\n\n"
@@ -262,26 +272,29 @@ def create_app(config_path: str = "config/config.json") -> Flask:
         s = sm.get_stats(user_id)
         return jsonify(s)
 
+    # ─── 注册中转代理 ───
+
+    from server.proxy import create_proxy_blueprint
+    proxy_bp = create_proxy_blueprint(config)
+    app.register_blueprint(proxy_bp)
+
     return app
 
 
 def run_server(host: str = "0.0.0.0", port: int = 8000, config_path: str = "config/config.json",
                debug: bool = False, workers: int = 4, server: str = "auto"):
-    """启动服务
-
-    Args:
-        server: "auto" 自动检测最佳服务器, "waitress" 强制用 waitress, "flask" 用开发服务器
-    """
+    """启动服务"""
     app = create_app(config_path)
     print(f"Light Agent Server: http://{host}:{port}")
-    print(f"   POST /api/chat          - 对话")
-    print(f"   POST /api/chat/stream   - 流式对话")
-    print(f"   POST /api/sessions      - 创建会话")
-    print(f"   POST /api/users         - 创建用户")
-    print(f"   POST /api/search        - 搜索记忆")
-    print(f"   GET  /api/health        - 健康检查")
+    print(f"   POST /api/chat            - Agent 对话")
+    print(f"   POST /api/chat/stream     - 流式对话")
+    print(f"   POST /v1/chat/completions - OpenAI 兼容中转")
+    print(f"   POST /api/sessions        - 创建会话")
+    print(f"   POST /api/users           - 创建用户")
+    print(f"   POST /api/search          - 搜索记忆")
+    print(f"   GET  /api/health          - 健康检查")
+    print(f"   GET  /                    - Web UI")
 
-    # 自动选择服务器
     if server == "auto":
         if debug:
             server = "flask"
@@ -300,7 +313,3 @@ def run_server(host: str = "0.0.0.0", port: int = 8000, config_path: str = "conf
         if not debug:
             print("   WARNING: Flask 开发服务器不适合生产环境，请安装 waitress: pip install waitress")
         app.run(host=host, port=port, debug=debug)
-
-
-if __name__ == "__main__":
-    run_server()
