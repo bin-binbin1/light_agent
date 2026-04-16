@@ -5,6 +5,7 @@ OpenAI Function Calling 风格
 """
 
 import json
+import asyncio
 import inspect
 import importlib
 import sys
@@ -254,6 +255,23 @@ class Tool:
         except Exception as e:
             return f"工具执行错误: {str(e)}"
 
+    async def aexecute(self, arguments: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> str:
+        """异步执行工具，支持 async 函数"""
+        try:
+            if context:
+                sig = inspect.signature(self.function)
+                inject = {k: v for k, v in context.items() if k in sig.parameters}
+                arguments = {**arguments, **inject}
+            if inspect.iscoroutinefunction(self.function):
+                result = await self.function(**arguments)
+            else:
+                result = await asyncio.to_thread(self.function, **arguments)
+            if isinstance(result, (dict, list)):
+                return json.dumps(result, ensure_ascii=False)
+            return str(result)
+        except Exception as e:
+            return f"工具执行错误: {str(e)}"
+
 
 class ToolRegistry:
     """工具注册表"""
@@ -365,6 +383,13 @@ class ToolRegistry:
         if not tool:
             return f"工具 '{name}' 不存在"
         return tool.execute(arguments, context=self._context)
+
+    async def aexecute(self, name: str, arguments: Dict[str, Any]) -> str:
+        """异步执行指定工具"""
+        tool = self.get(name)
+        if not tool:
+            return f"工具 '{name}' 不存在"
+        return await tool.aexecute(arguments, context=self._context)
 
 
 def create_default_tools(memory=None) -> ToolRegistry:

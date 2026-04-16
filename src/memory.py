@@ -4,6 +4,7 @@ Memory 模块 v2 - 全量存储 + 智能检索
 """
 
 import json
+import asyncio
 import sqlite3
 import time
 import hashlib
@@ -28,7 +29,7 @@ class Memory:
         self.config = config
         self.llm = llm
         self.embedding_fn = embedding_fn  # 可选的 embedding 函数
-        self.conn = sqlite3.connect(config.db_path)
+        self.conn = sqlite3.connect(config.db_path, check_same_thread=False)
         self._current_session: Optional[str] = None
         self._init_db()
 
@@ -415,3 +416,24 @@ class Memory:
 
     def close(self):
         self.conn.close()
+
+    # ─── 异步包装 ───
+
+    async def aadd_message(self, session_id: str, role: str, content: str,
+                           tool_calls=None, tool_call_id=None):
+        await asyncio.to_thread(self.add_message, session_id, role, content, tool_calls, tool_call_id)
+
+    async def atouch_session(self, session_id: str):
+        await asyncio.to_thread(self.touch_session, session_id)
+
+    async def ashould_compress(self, session_id: str) -> bool:
+        return await asyncio.to_thread(self.should_compress, session_id)
+
+    async def ashould_compress_idle(self, session_id: str) -> bool:
+        return await asyncio.to_thread(self.should_compress_idle, session_id)
+
+    async def acompress(self, session_id: str, summarizer_llm=None):
+        await asyncio.to_thread(self.compress, session_id, summarizer_llm)
+
+    async def aget_context_for_llm(self, session_id: str) -> List[Dict]:
+        return await asyncio.to_thread(self.get_context_for_llm, session_id)

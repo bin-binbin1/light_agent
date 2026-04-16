@@ -4,8 +4,9 @@ Agent 模块 - 对话管理核心
 """
 
 import json
+import asyncio
 import uuid
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, AsyncGenerator, Union
 from dataclasses import dataclass, field
 
 from .llm import BaseLLM, Message, LLMResponse
@@ -182,3 +183,76 @@ class Agent:
     def get_history(self) -> List[Dict]:
         """获取对话历史"""
         return self.memory.get_messages(self.session_id)
+
+    # ─── 异步流式对话 ───
+
+    async def achat_stream(self, user_input: str) -> AsyncGenerator[str, None]:
+        """异步流式对话，yield 文本片段"""
+        await self.memory.aadd_message(self.session_id, "user", user_input)
+        await self.memory.atouch_session(self.session_id)
+        self.logger.system(f"收到用户消息: {user_input[:100]}")
+
+        if await self.memory.ashould_compress(self.session_id):
+            self.logger.compress("上下文即将超限，启动记忆压缩...")
+            await self.memory.acompress(self.session_id)
+            self.logger.compress("压缩完成")
+        elif await self.memory.ashould_compress_idle(self.session_id):
+            self.logger.compress(f"闲置超过{self.config.memory_config.idle_compress_hours}h且未压缩过，启动记忆压缩...")
+            await self.memory.acompress(self.session_id)
+            self.logger.compress("压缩完成")
+
+        messages = await asyncio.to_thread(self._build_messages)
+        tools = self.tools.to_openai_format() or None
+
+        async for chunk in self._astream_with_tool_handling(messages, tools):
+            yield chunk
+
+    async def _astream_with_tool_handling(self, messages: List, tools) -> AsyncGenerator[str, None]:
+        """流式调用 LLM，检测 tool calls 并处理"""
+        from .llm import LLMResponse
+
+        accumulated_content = ""
+        tool_call_response = None
+
+        async for chunk in self.llm.achat_stream(
+            messages=messages, tools=tools,
+            temperature=self.config.temperature,
+            max_tokens=self.config.max_tokens,
+        ):
+            if isinstance(chunk, LLMResponse):
+                tool_call_response = chunk
+            else:
+                accumulated_content += chunk
+                yield chunk
+
+        if tool_call_response and tool_call_response.tool_calls:
+            async for chunk in self._ahandle_tool_calls_stream(tool_call_response, tools):
+                yield chunk
+        else:
+            await self.memory.aadd_message(self.session_id, "assistant", accumulated_content)
+            self.logger.response(accumulated_content)
+
+    async def _ahandle_tool_calls_stream(self, response, tools) -> AsyncGenerator[str, None]:
+        """执行工具调用，然后流式获取后续 LLM 回复"""
+        tc_dicts = [
+            {"id": tc.id, "type": "function",
+             "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)}}
+            for tc in response.tool_calls
+        ]
+        await self.memory.aadd_message(
+            self.session_id, "assistant", response.content or "", tool_calls=tc_dicts
+        )
+
+        if self.config.debug:
+            self.logger.log(LogType.TOOL_CALL_REASON, f"tool_call_reason: {response.content}")
+
+        for tc in response.tool_calls:
+            self.logger.tool_call(tc.name, str(tc.arguments))
+            result = await self.tools.aexecute(tc.name, tc.arguments)
+            self.logger.tool_result(tc.name, result)
+            await self.memory.aadd_message(self.session_id, "tool", result, tool_call_id=tc.id)
+
+        messages = await asyncio.to_thread(self._build_messages)
+
+        async for chunk in self._astream_with_tool_handling(messages, tools):
+            yield chunk

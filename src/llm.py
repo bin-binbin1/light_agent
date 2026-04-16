@@ -5,10 +5,12 @@ LLM 统一接口 - 封装多家大模型 API
 """
 
 import json
+import asyncio
 import base64
 import requests
+import httpx
 from abc import ABC, abstractmethod
-from typing import List, Dict, Optional, Any, Union
+from typing import List, Dict, Optional, Any, Union, AsyncGenerator
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -125,6 +127,14 @@ class BaseLLM(ABC):
              temperature: float = 0.7, max_tokens: int = 4096) -> LLMResponse:
         """文本/视觉对话"""
         pass
+
+    async def achat_stream(self, messages: List[Message], tools: Optional[List[Dict]] = None,
+                          temperature: float = 0.7, max_tokens: int = 4096
+                          ) -> AsyncGenerator[Union[str, "LLMResponse"], None]:
+        """异步流式对话，yield 文本片段。默认 fallback 到同步 chat"""
+        response = await asyncio.to_thread(self.chat, messages, tools, temperature, max_tokens)
+        if response.content:
+            yield response.content
 
     def supports(self, capability: LLMType) -> bool:
         """检查是否支持某能力"""
@@ -283,6 +293,99 @@ class OpenAICompatibleLLM(BaseLLM):
             usage=data.get("usage"),
             raw=data
         )
+
+    async def achat_stream(self, messages: List[Message], tools: Optional[List[Dict]] = None,
+                           temperature: float = 0.7, max_tokens: int = 4096
+                           ) -> AsyncGenerator[Union[str, LLMResponse], None]:
+        """异步流式对话。yield str 文本片段；若有 tool_calls 则最后 yield LLMResponse"""
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        has_image = any(
+            isinstance(m.content, list) and
+            any(c.get("type") == "image_url" for c in m.content if isinstance(c, dict))
+            for m in messages
+        )
+        model = self.vision_model if has_image else self.model
+
+        payload = {
+            "model": model,
+            "messages": [_msg_to_dict(m) for m in messages],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if tools:
+            payload["tools"] = tools
+
+        accumulated_content = ""
+        tool_call_chunks: Dict[int, Dict] = {}
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+            async with client.stream(
+                "POST", f"{self.base_url}/chat/completions",
+                headers=headers, json=payload,
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    choices = chunk.get("choices", [])
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {})
+
+                    # 文本内容
+                    content_piece = delta.get("content")
+                    if content_piece:
+                        accumulated_content += content_piece
+                        yield content_piece
+
+                    # tool call 增量
+                    tc_deltas = delta.get("tool_calls")
+                    if tc_deltas:
+                        for tc_delta in tc_deltas:
+                            idx = tc_delta.get("index", 0)
+                            if idx not in tool_call_chunks:
+                                tool_call_chunks[idx] = {
+                                    "id": tc_delta.get("id", ""),
+                                    "name": tc_delta.get("function", {}).get("name", ""),
+                                    "arguments": "",
+                                }
+                            else:
+                                if tc_delta.get("id"):
+                                    tool_call_chunks[idx]["id"] = tc_delta["id"]
+                                if tc_delta.get("function", {}).get("name"):
+                                    tool_call_chunks[idx]["name"] = tc_delta["function"]["name"]
+                            arg_piece = tc_delta.get("function", {}).get("arguments", "")
+                            if arg_piece:
+                                tool_call_chunks[idx]["arguments"] += arg_piece
+
+        # 如果有 tool calls，组装为 LLMResponse yield 出去
+        if tool_call_chunks:
+            tool_calls = []
+            for idx in sorted(tool_call_chunks.keys()):
+                tc = tool_call_chunks[idx]
+                try:
+                    args = json.loads(tc["arguments"])
+                except json.JSONDecodeError:
+                    args = {"_raw": tc["arguments"]}
+                tool_calls.append(ToolCall(
+                    id=tc["id"] or f"call_{idx}",
+                    name=tc["name"],
+                    arguments=args,
+                ))
+            yield LLMResponse(content=accumulated_content, tool_calls=tool_calls)
 
 
 # ─── TTS 专用接口 ───
