@@ -7,6 +7,8 @@ LLM 统一接口 - 封装多家大模型 API
 import json
 import asyncio
 import base64
+import random
+import time as _time
 import requests
 import httpx
 from abc import ABC, abstractmethod
@@ -14,6 +16,8 @@ from typing import List, Dict, Optional, Any, Union, AsyncGenerator
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+
+from .agent_logging import default_logger as _logger
 
 
 # ─── 数据结构 ───
@@ -187,13 +191,41 @@ class OpenAICompatibleLLM(BaseLLM):
         if tools:
             payload["tools"] = tools
 
+        # 429 重试：最多 5 次，指数退避 + 抖动
+        max_retries = 5
+        response = None
+        for attempt in range(max_retries + 1):
+            try:
+                response = requests.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=120
+                )
+                if response.status_code == 429 and attempt < max_retries:
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            wait = float(retry_after)
+                        except ValueError:
+                            wait = 2 ** attempt
+                    else:
+                        wait = (2 ** attempt) + random.uniform(0, 1)
+                    _logger.error(f"LLM 429 Too Many Requests (第 {attempt+1}/{max_retries} 次重试)，等待 {wait:.1f}s")
+                    _time.sleep(wait)
+                    continue
+                response.raise_for_status()
+                data = response.json()
+                return self._parse_response(data)
+            except requests.exceptions.HTTPError as e:
+                break  # 非 429 错误直接跳出进入错误处理
+            except requests.exceptions.RequestException as e:
+                return LLMResponse(
+                    content="",
+                    raw={"error": True, "error_message": f"网络错误: {str(e)}"}
+                )
+
         try:
-            response = requests.post(
-                f"{self.base_url}/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=120
-            )
             response.raise_for_status()
             data = response.json()
             return self._parse_response(data)
@@ -323,11 +355,32 @@ class OpenAICompatibleLLM(BaseLLM):
         accumulated_content = ""
         tool_call_chunks: Dict[int, Dict] = {}
 
+        # 429 重试：发送请求前先用 client.send 检测状态码
+        max_retries = 5
         async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
-            async with client.stream(
-                "POST", f"{self.base_url}/chat/completions",
-                headers=headers, json=payload,
-            ) as resp:
+            resp = None
+            for attempt in range(max_retries + 1):
+                req = client.build_request(
+                    "POST", f"{self.base_url}/chat/completions",
+                    headers=headers, json=payload,
+                )
+                resp = await client.send(req, stream=True)
+                if resp.status_code == 429 and attempt < max_retries:
+                    await resp.aclose()
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            wait = float(retry_after)
+                        except ValueError:
+                            wait = 2 ** attempt
+                    else:
+                        wait = (2 ** attempt) + random.uniform(0, 1)
+                    _logger.error(f"LLM 429 Too Many Requests (stream, 第 {attempt+1}/{max_retries} 次重试)，等待 {wait:.1f}s")
+                    await asyncio.sleep(wait)
+                    continue
+                break
+
+            try:
                 resp.raise_for_status()
                 async for line in resp.aiter_lines():
                     if not line.startswith("data: "):
@@ -370,6 +423,8 @@ class OpenAICompatibleLLM(BaseLLM):
                             arg_piece = tc_delta.get("function", {}).get("arguments", "")
                             if arg_piece:
                                 tool_call_chunks[idx]["arguments"] += arg_piece
+            finally:
+                await resp.aclose()
 
         # 如果有 tool calls，组装为 LLMResponse yield 出去
         if tool_call_chunks:
@@ -427,6 +482,78 @@ class OpenAITTS:
             audio_data=response.content,
             format=response_format
         )
+
+
+# ─── 小米 TTS（走 chat/completions）───
+
+class XiaomiTTS:
+    """小米 MIMO TTS 接口
+
+    小米把 TTS 接到了 /chat/completions 上，输入是 messages，
+    返回的 audio 数据在 choices[0].message.audio 里（base64）。
+    """
+
+    def __init__(self, api_key: str, base_url: str,
+                 model: str = "xiaomi/mimo-v2-tts",
+                 voice: str = "mimo_default",
+                 audio_format: str = "wav"):
+        self.api_key = api_key
+        self.base_url = base_url
+        self.model = model
+        self.voice = voice
+        self.audio_format = audio_format
+
+    def synthesize(self, text: str, voice: str = None, model: str = None,
+                   response_format: str = None, **_ignored) -> TTSResponse:
+        """文字转语音"""
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        fmt = response_format or self.audio_format
+        payload = {
+            "model": model or self.model,
+            "messages": [
+                {"role": "assistant", "content": text},
+            ],
+            "audio": {
+                "format": fmt,
+                "voice": voice or self.voice,
+            },
+        }
+
+        response = requests.post(
+            f"{self.base_url}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=60,
+        )
+        if response.status_code >= 400:
+            try:
+                err_detail = response.json()
+            except Exception:
+                err_detail = response.text
+            raise requests.exceptions.HTTPError(
+                f"{response.status_code} {response.reason}: {json.dumps(err_detail, ensure_ascii=False) if isinstance(err_detail, dict) else err_detail}"
+            )
+        data = response.json()
+
+        # 尝试从常见位置提取 base64 音频
+        audio_b64 = None
+        try:
+            msg = data["choices"][0]["message"]
+            if isinstance(msg.get("audio"), dict):
+                audio_b64 = msg["audio"].get("data")
+            elif "audio" in data:
+                audio_b64 = data["audio"].get("data") if isinstance(data["audio"], dict) else data["audio"]
+        except (KeyError, IndexError, TypeError):
+            pass
+
+        if not audio_b64:
+            raise ValueError(f"TTS 响应未包含音频数据: {json.dumps(data, ensure_ascii=False)[:500]}")
+
+        audio_bytes = base64.b64decode(audio_b64)
+        return TTSResponse(audio_data=audio_bytes, format=fmt)
 
 
 # ─── STT 专用接口 ───

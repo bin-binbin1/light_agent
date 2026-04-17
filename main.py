@@ -13,7 +13,7 @@ from src.llm import LLMFactory, BaseLLM
 from src.agent import Agent, AgentConfig
 from src.memory import MemoryConfig
 from src.tools import ToolRegistry, create_default_tools
-from src.logging import Logger, LogConfig, LogLevel
+from src.agent_logging import Logger, LogConfig, LogLevel
 from src.config import Config
 
 

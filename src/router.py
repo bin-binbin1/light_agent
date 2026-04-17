@@ -6,7 +6,7 @@ Router 模块 - 多 Agent 路由 + 能力路由
 from typing import Dict, Optional, Callable, List
 from .agent import Agent, AgentConfig
 from .llm import BaseLLM, LLMFactory, LLMType
-from .logging import Logger, default_logger
+from .agent_logging import Logger, default_logger
 
 
 class ModelPool:

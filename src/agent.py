@@ -13,7 +13,7 @@ from .llm import BaseLLM, Message, LLMResponse
 from .memory import Memory, MemoryConfig
 from .tools import ToolRegistry, create_default_tools
 from .prompt import PromptManager
-from .logging import Logger, default_logger, LogType
+from .agent_logging import Logger, default_logger, LogType
 
 
 @dataclass

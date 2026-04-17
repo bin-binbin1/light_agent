@@ -21,7 +21,7 @@ from src.agent import Agent, AgentConfig
 from src.memory import MemoryConfig
 from src.llm import LLMFactory, LLMType, Message
 from src.tools import create_default_tools
-from src.logging import Logger, LogConfig, LogLevel
+from src.agent_logging import Logger, LogConfig, LogLevel
 from src.config import Config
 
 

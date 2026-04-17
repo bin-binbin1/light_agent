@@ -94,8 +94,8 @@ class Logger:
     def tool_call(self, name: str, arguments: str):
         self.log(LogType.TOOL_CALL, f"{name}({arguments})")
 
-    def tool_result(self, name: str, result: str):
-        preview = result[:200] + "..." if len(result) > 200 else result
+    def tool_result(self, name: str, result: str, max_length: int = 200):
+        preview = result[:max_length] + "..." if len(result) > max_length else result
         self.log(LogType.TOOL_RESULT, f"{name} → {preview}")
 
     def response(self, content: str):
