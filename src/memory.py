@@ -74,6 +74,13 @@ class Memory:
                 chunk_index INTEGER,
                 FOREIGN KEY (message_id) REFERENCES messages(id)
             );
+
+            CREATE TABLE IF NOT EXISTS context_snapshots (
+                session_id TEXT PRIMARY KEY,
+                user_id TEXT,
+                context TEXT,
+                updated_at REAL
+            );
         """)
         self.conn.commit()
 
@@ -196,7 +203,7 @@ class Memory:
                 total += len(json.dumps(msg["tool_calls"])) * 1.2
         return int(total)
 
-    def should_compress(self, session_id: str) -> bool:
+    def should_compress(self, session_id: str, context: List[Dict] = None) -> bool:
         row = self.conn.execute(
             "SELECT context_window FROM sessions WHERE session_id = ?",
             (session_id,)
@@ -204,8 +211,8 @@ class Memory:
         if not row:
             return False
         context_window = row[0]
-        all_msgs = self.get_all_messages(session_id)
-        estimated = self.estimate_token_usage(all_msgs)
+        msgs = context if context is not None else self.get_all_messages(session_id)
+        estimated = self.estimate_token_usage(msgs)
         return estimated / context_window > self.config.compress_threshold
 
     def should_compress_idle(self, session_id: str) -> bool:
@@ -234,45 +241,40 @@ class Memory:
 
     # ─── 压缩 ───
 
-    def compress(self, session_id: str, summarizer_llm=None):
-        """压缩：全量消息 → 摘要 + 最近消息"""
+    def compress(self, session_id: str, context: List[Dict] = None, summarizer_llm=None) -> List[Dict]:
+        """压缩上下文：旧消息生成摘要，返回 [摘要] + [最近消息]"""
         llm = summarizer_llm or self.llm
         if not llm:
             raise ValueError("压缩需要提供 LLM 实例")
 
-        all_msgs = self.get_all_messages(session_id)
-        total = len(all_msgs)
+        msgs = context if context is not None else self.get_all_messages(session_id)
+        total = len(msgs)
         keep_count = max(int(total * self.config.keep_ratio), 6)
 
         if total <= keep_count:
-            return
+            return msgs
 
-        to_compress = all_msgs[:total - keep_count]
+        to_compress = msgs[:total - keep_count]
+        to_keep = msgs[total - keep_count:]
 
-        # 生成摘要
         summary = self._summarize(to_compress, llm)
 
-        # 保存摘要
-        now = time.time()
-        user_id = self.get_user_id(session_id)
-        self.conn.execute(
-            "INSERT INTO summaries (session_id, user_id, summary, message_range_start, message_range_end, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-            (session_id, user_id, summary, 1, total - keep_count, now)
-        )
-        self.conn.commit()
+        new_context = [{"role": "system", "content": f"[历史对话摘要]\n{summary}"}] + to_keep
+        return new_context
 
     def _summarize(self, messages: List[Dict], llm) -> str:
+        from .llm import Message
+
         conv_text = "\n".join([
             f"[{m['role']}]: {m.get('content', '')}"
             for m in messages if m.get("content")
         ])
-        # 截断避免摘要本身太长
         if len(conv_text) > 50000:
             conv_text = conv_text[:50000] + "\n... (已截断)"
 
         summary_messages = [
-            {"role": "system", "content": "你是对话摘要助手。请将以下对话提炼为简洁的摘要，保留关键信息、决策、结论和重要细节。用中文输出。"},
-            {"role": "user", "content": f"请总结以下对话：\n\n{conv_text}"}
+            Message(role="system", content="你是对话摘要助手。请将以下对话提炼为简洁的摘要，保留关键信息、决策、结论和重要细节。用中文输出。"),
+            Message(role="user", content=f"请总结以下对话：\n\n{conv_text}"),
         ]
         response = llm.chat(summary_messages, temperature=0.3, max_tokens=3000)
         return response.content
@@ -298,6 +300,36 @@ class Memory:
         # 最近消息
         messages.extend(self.get_recent_messages(session_id))
         return messages
+
+    # ─── 上下文快照（Write-Back Cache） ───
+
+    def save_context(self, session_id: str, context: List[Dict]):
+        """将内存上下文快照存入 SQLite"""
+        user_id = self.get_user_id(session_id)
+        ctx_json = json.dumps(context, ensure_ascii=False)
+        self.conn.execute(
+            "INSERT OR REPLACE INTO context_snapshots (session_id, user_id, context, updated_at) VALUES (?, ?, ?, ?)",
+            (session_id, user_id, ctx_json, time.time())
+        )
+        self.conn.commit()
+
+    def load_context(self, session_id: str) -> List[Dict]:
+        """从快照加载上下文，无快照则用 get_context_for_llm 兜底"""
+        row = self.conn.execute(
+            "SELECT context FROM context_snapshots WHERE session_id = ?",
+            (session_id,)
+        ).fetchone()
+        if row and row[0]:
+            return json.loads(row[0])
+        return self.get_context_for_llm(session_id)
+
+    def delete_context_snapshot(self, session_id: str):
+        """删除上下文快照"""
+        self.conn.execute(
+            "DELETE FROM context_snapshots WHERE session_id = ?",
+            (session_id,)
+        )
+        self.conn.commit()
 
     # ─── RAG 检索 ───
 
@@ -426,14 +458,20 @@ class Memory:
     async def atouch_session(self, session_id: str):
         await asyncio.to_thread(self.touch_session, session_id)
 
-    async def ashould_compress(self, session_id: str) -> bool:
-        return await asyncio.to_thread(self.should_compress, session_id)
+    async def ashould_compress(self, session_id: str, context: List[Dict] = None) -> bool:
+        return await asyncio.to_thread(self.should_compress, session_id, context)
 
     async def ashould_compress_idle(self, session_id: str) -> bool:
         return await asyncio.to_thread(self.should_compress_idle, session_id)
 
-    async def acompress(self, session_id: str, summarizer_llm=None):
-        await asyncio.to_thread(self.compress, session_id, summarizer_llm)
+    async def acompress(self, session_id: str, context: List[Dict] = None, summarizer_llm=None) -> List[Dict]:
+        return await asyncio.to_thread(self.compress, session_id, context, summarizer_llm)
 
     async def aget_context_for_llm(self, session_id: str) -> List[Dict]:
         return await asyncio.to_thread(self.get_context_for_llm, session_id)
+
+    async def asave_context(self, session_id: str, context: List[Dict]):
+        await asyncio.to_thread(self.save_context, session_id, context)
+
+    async def aload_context(self, session_id: str) -> List[Dict]:
+        return await asyncio.to_thread(self.load_context, session_id)
