@@ -14,6 +14,10 @@ from .memory import Memory, MemoryConfig
 from .tools import ToolRegistry, create_default_tools
 from .prompt import PromptManager
 from .agent_logging import Logger, default_logger, LogType
+from .events import (
+    AgentEvent, ThinkingEvent, ToolCallEvent, ToolResultEvent,
+    RetryEvent, ErrorEvent,
+)
 
 
 @dataclass
@@ -137,7 +141,7 @@ class Agent:
         self.memory.add_message(self.session_id, "user", user_input)
         self._append_context("user", user_input)
         self.memory.touch_session(self.session_id)
-        self.logger.system(f"收到用户消息: {user_input[:100]}")
+        self.logger.system(f"收到用户消息: {user_input[:200]}")
 
         # 同步模式下仍然同步压缩
         if self.memory.should_compress(self.session_id, self._context):
@@ -227,8 +231,8 @@ class Agent:
 
     # ─── 异步流式对话 ───
 
-    async def achat_stream(self, user_input: str) -> AsyncGenerator[str, None]:
-        """异步流式对话，yield 文本片段"""
+    async def achat_stream(self, user_input: str) -> AsyncGenerator[Union[str, AgentEvent], None]:
+        """异步流式对话，yield 文本片段或 AgentEvent 状态事件"""
         await self.memory.aadd_message(self.session_id, "user", user_input)
         self._append_context("user", user_input)
         await self.memory.atouch_session(self.session_id)
@@ -237,14 +241,23 @@ class Agent:
         # 后台异步压缩，不阻塞用户
         self._maybe_start_compress()
 
+        # 先发思考状态
+        yield ThinkingEvent()
+
         messages = self._build_messages()
         tools = self.tools.to_openai_format() or None
 
-        async for chunk in self._astream_with_tool_handling(messages, tools):
-            yield chunk
+        try:
+            async for chunk in self._astream_with_tool_handling(messages, tools):
+                yield chunk
+        except Exception as e:
+            yield ErrorEvent(message=str(e))
+            raise
 
-    async def _astream_with_tool_handling(self, messages: List, tools) -> AsyncGenerator[str, None]:
+    async def _astream_with_tool_handling(self, messages: List, tools) -> AsyncGenerator[Union[str, AgentEvent], None]:
         """流式调用 LLM，检测 tool calls 并处理"""
+        import time as _time
+
         accumulated_content = ""
         tool_call_response = None
 
@@ -255,6 +268,9 @@ class Agent:
         ):
             if isinstance(chunk, LLMResponse):
                 tool_call_response = chunk
+            elif isinstance(chunk, AgentEvent):
+                # LLM 层冒泡上来的事件（如 RetryEvent）
+                yield chunk
             else:
                 accumulated_content += chunk
                 yield chunk
@@ -267,8 +283,10 @@ class Agent:
             self._append_context("assistant", accumulated_content)
             self.logger.response(accumulated_content)
 
-    async def _ahandle_tool_calls_stream(self, response, tools) -> AsyncGenerator[str, None]:
+    async def _ahandle_tool_calls_stream(self, response, tools) -> AsyncGenerator[Union[str, AgentEvent], None]:
         """执行工具调用，然后流式获取后续 LLM 回复"""
+        import time as _time
+
         tc_dicts = [
             {"id": tc.id, "type": "function",
              "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)}}
@@ -284,11 +302,38 @@ class Agent:
 
         for tc in response.tool_calls:
             self.logger.tool_call(tc.name, str(tc.arguments))
-            result = await self.tools.aexecute(tc.name, tc.arguments)
+            # 发工具调用开始事件（仅 display 文案，不透出原始参数）
+            tool_def = self.tools.get(tc.name)
+            display_calling = tool_def.display_calling if tool_def else f"调用 {tc.name}..."
+            yield ToolCallEvent(name=tc.name, display=display_calling)
+
+            t0 = _time.time()
+            success = True
+            try:
+                result = await self.tools.aexecute(tc.name, tc.arguments)
+            except Exception as e:
+                result = f"工具执行错误: {e}"
+                success = False
+            duration_ms = int((_time.time() - t0) * 1000)
+
             self.logger.tool_result(tc.name, result)
+            # 发工具结果事件（仅 display 文案，不透出原始结果）
+            if tool_def:
+                display_result = tool_def.display_done if success else tool_def.display_failed
+            else:
+                display_result = "调用成功" if success else "调用失败"
+            yield ToolResultEvent(
+                name=tc.name,
+                duration_ms=duration_ms,
+                success=success,
+                display=display_result,
+            )
+
             await self.memory.aadd_message(self.session_id, "tool", result, tool_call_id=tc.id)
             self._append_context("tool", result, tool_call_id=tc.id)
 
+        # 工具执行完，下一轮 LLM 调用前再发一次 thinking
+        yield ThinkingEvent()
         messages = self._build_messages()
 
         async for chunk in self._astream_with_tool_handling(messages, tools):

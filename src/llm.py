@@ -18,6 +18,7 @@ from enum import Enum
 from pathlib import Path
 
 from .agent_logging import default_logger as _logger
+from .events import RetryEvent
 
 
 # ─── 数据结构 ───
@@ -328,7 +329,7 @@ class OpenAICompatibleLLM(BaseLLM):
 
     async def achat_stream(self, messages: List[Message], tools: Optional[List[Dict]] = None,
                            temperature: float = 0.7, max_tokens: int = 4096
-                           ) -> AsyncGenerator[Union[str, LLMResponse], None]:
+                           ) -> AsyncGenerator[Union[str, LLMResponse, RetryEvent], None]:
         """异步流式对话。yield str 文本片段；若有 tool_calls 则最后 yield LLMResponse"""
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -376,6 +377,13 @@ class OpenAICompatibleLLM(BaseLLM):
                     else:
                         wait = (2 ** attempt) + random.uniform(0, 1)
                     _logger.error(f"LLM 429 Too Many Requests (stream, 第 {attempt+1}/{max_retries} 次重试)，等待 {wait:.1f}s")
+                    # 通知上层（Agent/server/前端）
+                    yield RetryEvent(
+                        reason="429",
+                        attempt=attempt + 1,
+                        max_attempts=max_retries,
+                        wait_seconds=wait,
+                    )
                     await asyncio.sleep(wait)
                     continue
                 break

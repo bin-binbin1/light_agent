@@ -97,7 +97,11 @@ def auto_infer_tool_info(func) -> Dict[str, Any]:
 
 
 def tool(func=None, *, name: Optional[str] = None, description: Optional[str] = None,
-         parameters: Optional[Dict[str, Any]] = None, required: Optional[List[str]] = None):
+         parameters: Optional[Dict[str, Any]] = None, required: Optional[List[str]] = None,
+         display_name: Optional[str] = None,
+         display_calling: Optional[str] = None,
+         display_done: Optional[str] = None,
+         display_failed: Optional[str] = None):
     """
     工具注册装饰器
 
@@ -107,6 +111,10 @@ def tool(func=None, *, name: Optional[str] = None, description: Optional[str] = 
         description: 工具描述（可选，默认使用docstring第一行）
         parameters: 参数定义（可选，默认自动推断）
         required: 必需参数列表（可选，默认自动推断）
+        display_name: 对用户展示的工具名，如"查询驾驶事件"
+        display_calling: 调用中文案，默认"调用 {display_name}..."
+        display_done: 成功文案，默认"调用成功"
+        display_failed: 失败文案，默认"调用失败"
     """
     def decorator(f):
         # 存储工具元数据
@@ -114,7 +122,11 @@ def tool(func=None, *, name: Optional[str] = None, description: Optional[str] = 
             "name": name,
             "description": description,
             "parameters": parameters,
-            "required": required
+            "required": required,
+            "display_name": display_name,
+            "display_calling": display_calling,
+            "display_done": display_done,
+            "display_failed": display_failed,
         }
         return f
 
@@ -223,6 +235,10 @@ class Tool:
     function: Callable
     required: List[str] = field(default_factory=list)
     context_keys: List[str] = field(default_factory=list)  # 由 context 注入的参数名，不暴露给 LLM
+    display_name: str = ""         # 对用户展示的工具名
+    display_calling: str = ""      # 调用中文案
+    display_done: str = ""         # 成功文案
+    display_failed: str = ""       # 失败文案
 
     def to_openai_format(self) -> Dict:
         """转为 OpenAI function calling 格式（排除 context 注入的参数）"""
@@ -320,6 +336,12 @@ class ToolRegistry:
         parameters = metadata.get('parameters') or inferred_info['parameters']
         required = metadata.get('required') or inferred_info['required']
 
+        # display 文案 fallback
+        display_name = metadata.get('display_name') or name
+        display_calling = metadata.get('display_calling') or f"调用 {display_name}..."
+        display_done = metadata.get('display_done') or "调用成功"
+        display_failed = metadata.get('display_failed') or "调用失败"
+
         # 注册工具
         tool = Tool(
             name=name,
@@ -327,7 +349,11 @@ class ToolRegistry:
             parameters=parameters,
             function=func,
             required=required,
-            context_keys=[k for k in self._context if k in inspect.signature(func).parameters]
+            context_keys=[k for k in self._context if k in inspect.signature(func).parameters],
+            display_name=display_name,
+            display_calling=display_calling,
+            display_done=display_done,
+            display_failed=display_failed,
         )
         self._tools[name] = tool
         return tool
