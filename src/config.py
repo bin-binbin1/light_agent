@@ -1,32 +1,64 @@
 """
 Config 模块 - 配置管理
-支持读取、修改、保存配置
+支持读取、修改、保存；并提供 create_agent_from_config() 一步创建 Agent
 """
 
 import json
 import os
-from typing import Any, Optional
+from typing import Any, Optional, List
 from pathlib import Path
 
 
 DEFAULT_CONFIG = {
+    # —— 基本身份 ——
     "name": "assistant",
     "provider": "openai",
     "api_key": "",
     "model": "",
+    "base_url": "",              # OpenAI-兼容端点；自建/厂商专用时必填
+    "vision_model": "",          # 多模态模型名（可选）
+    "tts_model": "",             # TTS 模型名（可选）
+    "tts_voice": "",             # TTS 默认音色（可选）
+
+    # —— 对话行为 ——
     "system_prompt": "你是一个有用的 AI 助手。",
     "context_window": 128000,
     "temperature": 0.7,
     "max_tokens": 4096,
+
+    # —— 记忆 ——
     "memory_db": "memory.db",
+    "dialect": "sqlite",         # 记忆存储方言：sqlite / mysql
     "compress_threshold": 0.5,
     "keep_ratio": 0.3,
     "idle_compress_hours": 6,
+
+    # —— 日志 / 会话 ——
     "debug": False,
     "colorize": True,
     "user_id": "default_user",
     "session_id": "",
 }
+
+
+# ─── 每个 provider 对应的环境变量名列表（优先级从前往后） ──
+ENV_KEY_NAMES = {
+    "xiaomi": ["MIFY_KEY"],
+    "openai": ["OPENAI_API_KEY"],
+    "deepseek": ["DEEPSEEK_API_KEY"],
+    "kimi": ["KIMI_API_KEY", "MOONSHOT_API_KEY"],
+    "minimax": ["MINIMAX_API_KEY"],
+    "grok": ["GROK_API_KEY", "XAI_API_KEY"],
+    "openrouter": ["OPENROUTER_API_KEY"],
+}
+
+
+def _get_env_key(provider: str) -> str:
+    for name in ENV_KEY_NAMES.get(provider, [f"{provider.upper()}_API_KEY"]):
+        v = os.environ.get(name)
+        if v:
+            return v
+    return ""
 
 
 class Config:
@@ -74,13 +106,19 @@ class Config:
 
     @property
     def api_key(self) -> str:
-        # 优先环境变量
-        env_key = f"{self.provider.upper()}_API_KEY"
-        return os.environ.get(env_key) or self.get("api_key", "")
+        """优先环境变量 (按 provider 查 ENV_KEY_NAMES)，其次 config 文件"""
+        return _get_env_key(self.provider) or self.get("api_key", "")
 
     @api_key.setter
     def api_key(self, value: str):
         self.set("api_key", value)
+
+    @property
+    def env_key_names(self) -> List[str]:
+        """当前 provider 支持的环境变量名列表，供错误提示使用"""
+        return ENV_KEY_NAMES.get(
+            self.provider, [f"{self.provider.upper()}_API_KEY"]
+        )
 
     @property
     def model(self) -> str:
@@ -89,6 +127,26 @@ class Config:
     @model.setter
     def model(self, value: str):
         self.set("model", value)
+
+    @property
+    def base_url(self) -> str:
+        return self.get("base_url", "")
+
+    @base_url.setter
+    def base_url(self, value: str):
+        self.set("base_url", value)
+
+    @property
+    def vision_model(self) -> str:
+        return self.get("vision_model", "")
+
+    @property
+    def dialect(self) -> str:
+        return self.get("dialect", "sqlite")
+
+    @property
+    def debug(self) -> bool:
+        return bool(self.get("debug", False))
 
     @property
     def context_window(self) -> int:
@@ -125,6 +183,97 @@ class Config:
     def __repr__(self):
         safe = {k: ("***" if k == "api_key" and v else v) for k, v in self._data.items()}
         return f"Config({safe})"
+
+    # ─── 一键创建 Agent ───
+    def create_agent_from_config(self,
+                                 resume: bool = True,
+                                 session_id: str = "",
+                                 user_id: str = "",
+                                 tools=None,
+                                 logger=None):
+        """按当前配置创建一个 Agent。
+
+        Args:
+            resume: True 时自动恢复该 user 最近的 session
+            session_id: 指定 session_id（优先级最高）
+            user_id: 覆盖 config 的 user_id
+            tools: 自定义 ToolRegistry（为空则 create_default_tools()）
+            logger: 自定义 Logger（为空则按 config.debug/colorize 创建）
+
+        Raises:
+            RuntimeError: model 或 api_key 缺失
+        """
+        # 延迟导入，避免循环依赖 & 让 Config 在不需要 Agent 时也能用
+        from .llm import LLMFactory, OpenAICompatibleLLM, LLMType
+        from .agent import Agent, AgentConfig
+        from .memory import Memory, MemoryConfig
+        from .tools import create_default_tools
+        from .agent_logging import Logger, LogConfig, LogLevel
+
+        if not self.model:
+            raise RuntimeError(
+                f"缺少 model，请在 {self.config_path} 里填写 model 字段。"
+            )
+        api_key = self.api_key
+        if not api_key:
+            raise RuntimeError(
+                f"缺少 api_key，请设置环境变量 {'/'.join(self.env_key_names)} "
+                f"或在 {self.config_path} 里填写 api_key 字段。"
+            )
+
+        # LLM：自建 base_url 或未知 provider 走 OpenAICompatibleLLM，否则走 LLMFactory
+        if self.base_url or self.provider not in LLMFactory.PROVIDERS:
+            caps = [LLMType.TEXT]
+            if self.vision_model:
+                caps.append(LLMType.VISION)
+            llm = OpenAICompatibleLLM(
+                api_key=api_key,
+                model=self.model,
+                base_url=self.base_url or "https://api.openai.com/v1",
+                vision_model=self.vision_model,
+                capabilities=caps,
+            )
+        else:
+            llm = LLMFactory.create(self.provider, api_key, self.model or None)
+
+        # user_id / session_id 解析
+        if not user_id:
+            user_id = self.get("user_id", "default_user")
+        db_path = self.get("memory_db", "memory.db")
+
+        if not session_id and resume:
+            mem = Memory(MemoryConfig(db_path=db_path, dialect=self.dialect))
+            session_id = mem.get_latest_session(user_id) or ""
+            mem.close()
+
+        agent_config = AgentConfig(
+            name=self.get("name", "assistant"),
+            system_prompt=self.get("system_prompt", "你是一个有用的 AI 助手。"),
+            context_window=self.context_window,
+            temperature=self.get("temperature", 0.7),
+            max_tokens=self.get("max_tokens", 4096),
+            memory_config=MemoryConfig(
+                db_path=db_path,
+                compress_threshold=self.compress_threshold,
+                keep_ratio=self.keep_ratio,
+                idle_compress_hours=self.idle_compress_hours,
+                dialect=self.dialect,
+            ),
+            debug=self.debug,
+            user_id=user_id,
+            session_id=session_id,
+        )
+
+        if logger is None:
+            logger = Logger(LogConfig(
+                level=LogLevel.DEBUG if self.debug else LogLevel.INFO,
+                colorize=self.get("colorize", True),
+            ))
+
+        if tools is None:
+            tools = create_default_tools()
+
+        return Agent(llm=llm, config=agent_config, tools=tools, logger=logger)
 
 
 def config_cli():
