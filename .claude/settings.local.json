@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"from src.dialect import get_dialect, DIALECTS; print\\('sqlite:', get_dialect\\('sqlite'\\)\\); print\\('mysql:', get_dialect\\('mysql'\\)\\)\")",
+      "Bash(python -c ':*)",
+      "Bash(python -m pytest tests/ -x --tb=short)",
+      "Bash(python -m pip install pytest -q)",
+      "Bash(python -m pytest tests/ --tb=short)",
+      "Bash(python -m pip install flask -q)"
+    ]
+  }
+}

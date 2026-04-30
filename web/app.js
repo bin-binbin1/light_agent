@@ -178,41 +178,201 @@ async function sendMessage() {
     appendMessage('user', message);
     scrollToBottom();
 
-    // 显示 loading
-    const loadingId = showLoading();
+    // 创建 assistant 气泡（内容稍后流式追加；先挂一个 loading 指示）
+    let asstBubble, asstContent;
+    ({ bubble: asstBubble, contentEl: asstContent } = appendAssistantBubble());
+    showThinking(asstBubble);
+    scrollToBottom();
+
+    const toolMap = new Map();       // name -> {bubble, contentEl} 工具气泡追踪
+    let asstText = '';               // 当前 assistant 气泡累积的文本（工具调用后会重置）
+    let hasTextStarted = false;      // 当前 assistant 气泡是否已收到第一帧文本
 
     try {
-        const res = await API.post('/api/chat', {
-            user_id: API.userId,
-            session_id: currentSessionId,
-            message: message
+        const resp = await fetch(`${API.server}/api/chat/stream`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                user_id: API.userId,
+                session_id: currentSessionId,
+                message: message,
+            }),
         });
 
-        removeLoading(loadingId);
+        if (!resp.ok || !resp.body) {
+            hideThinking(asstBubble);
+            asstContent.textContent = `❌ 连接失败: HTTP ${resp.status}`;
+            throw new Error(`HTTP ${resp.status}`);
+        }
 
-        if (res.response) {
-            appendMessage('assistant', res.response);
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
 
-            // 更新会话标题（如果是第一条消息）
-            const msgs = document.querySelectorAll('.message');
-            if (msgs.length === 2) {
-                const title = message.slice(0, 20) + (message.length > 20 ? '...' : '');
-                sessions = sessions.map(s =>
-                    s.session_id === currentSessionId ? {...s, title} : s
-                );
-                renderSessionList();
-                document.getElementById('sessionTitle').textContent = title;
+        outer: while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            const parts = buf.split('\n\n');
+            buf = parts.pop(); // 最后一段可能不完整
+
+            for (const part of parts) {
+                if (!part.startsWith('data:')) continue;
+                const raw = part.slice(5).trim();
+                if (!raw) continue;
+
+                let evt;
+                try { evt = JSON.parse(raw); }
+                catch (_) { continue; }
+
+                switch (evt.type) {
+                    case 'thinking':
+                        if (!hasTextStarted) showThinking(asstBubble);
+                        break;
+
+                    case 'text':
+                        if (!hasTextStarted) {
+                            hideThinking(asstBubble);
+                            hasTextStarted = true;
+                        }
+                        asstText += (evt.content || '');
+                        // 流式期间先纯文本追加，避免 markdown 半截解析
+                        asstContent.textContent = asstText;
+                        scrollToBottom();
+                        break;
+
+                    case 'tool_call': {
+                        // 当前 assistant 气泡若是空（仅有 thinking 或没内容），就先移除，避免一个空气泡卡在工具之前
+                        if (!asstText) {
+                            asstBubble.remove();
+                        } else {
+                            // 已经有文本，先把它固化（markdown 渲染）
+                            asstContent.innerHTML = renderMarkdown(asstText);
+                        }
+                        // 工具气泡插入到消息流
+                        const tb = appendToolBubble(evt);
+                        toolMap.set(evt.name, tb);
+                        // 为工具之后可能的 assistant 输出新建一个空气泡
+                        ({ bubble: asstBubble, contentEl: asstContent } = appendAssistantBubble());
+                        asstText = '';
+                        hasTextStarted = false;
+                        scrollToBottom();
+                        break;
+                    }
+
+                    case 'tool_result': {
+                        const tb = toolMap.get(evt.name);
+                        if (tb) updateToolBubble(tb, evt);
+                        scrollToBottom();
+                        break;
+                    }
+
+                    case 'retry':
+                        appendInfoBubble(`⏳ 限流重试 ${evt.attempt}/${evt.max_attempts}（等待 ${evt.wait_seconds?.toFixed?.(1) || evt.wait_seconds}s）`);
+                        scrollToBottom();
+                        break;
+
+                    case 'error':
+                        hideThinking(asstBubble);
+                        asstContent.textContent = `❌ ${evt.message || '未知错误'}`;
+                        break outer;
+
+                    case 'done':
+                        break outer;
+                }
             }
-        } else if (res.error) {
-            appendMessage('assistant', `❌ 错误: ${res.error}`);
+        }
+
+        // 流结束，对最终 assistant 文本做一次 markdown 重渲染
+        if (asstText) {
+            asstContent.innerHTML = renderMarkdown(asstText);
+        } else if (!hasTextStarted) {
+            // 没有任何文本产出（比如全是工具调用最后没接话），把空气泡移除
+            asstBubble.remove();
+        }
+
+        // 更新会话标题（如果是第一条消息）
+        const msgs = document.querySelectorAll('.message');
+        if (msgs.length <= 3) {
+            const title = message.slice(0, 20) + (message.length > 20 ? '...' : '');
+            sessions = sessions.map(s =>
+                s.session_id === currentSessionId ? { ...s, title } : s
+            );
+            renderSessionList();
+            document.getElementById('sessionTitle').textContent = title;
         }
     } catch (err) {
-        removeLoading(loadingId);
-        appendMessage('assistant', `❌ 连接失败: ${err.message}。请检查 Server URL 设置。`);
+        if (asstContent && !asstContent.textContent) {
+            asstContent.textContent = `❌ 连接失败: ${err.message}`;
+        }
     }
 
     btn.disabled = false;
     scrollToBottom();
+}
+
+// ─── 气泡构造/操作 ───
+
+function appendAssistantBubble() {
+    const container = document.getElementById('chatContainer');
+    const wrap = document.createElement('div');
+    wrap.className = 'message assistant';
+    wrap.innerHTML = '<div class="role">🤖 Agent</div><div class="content"></div>';
+    container.appendChild(wrap);
+    const contentEl = wrap.querySelector('.content');
+    return { bubble: wrap, contentEl };
+}
+
+function showThinking(bubble) {
+    const content = bubble.querySelector('.content');
+    if (!content) return;
+    if (content.querySelector('.thinking-dots')) return;
+    content.innerHTML = '<span class="thinking-dots"><span class="dot">.</span><span class="dot">.</span><span class="dot">.</span></span>';
+}
+
+function hideThinking(bubble) {
+    const content = bubble.querySelector('.content');
+    if (!content) return;
+    const dots = content.querySelector('.thinking-dots');
+    if (dots) {
+        content.innerHTML = '';
+    }
+}
+
+function appendToolBubble(evt) {
+    const container = document.getElementById('chatContainer');
+    const wrap = document.createElement('div');
+    wrap.className = 'tool-bubble running';
+    wrap.innerHTML = `
+        <span class="tool-spinner"></span>
+        <span class="tool-display">${escapeHtml(evt.display || evt.name || '调用工具中...')}</span>
+        <span class="tool-duration"></span>
+    `;
+    container.appendChild(wrap);
+    return { bubble: wrap, contentEl: wrap.querySelector('.tool-display'), durEl: wrap.querySelector('.tool-duration') };
+}
+
+function updateToolBubble(tb, evt) {
+    if (!tb) return;
+    tb.bubble.classList.remove('running');
+    tb.bubble.classList.add(evt.success ? 'success' : 'fail');
+    if (evt.display) tb.contentEl.textContent = evt.display;
+    if (evt.duration_ms != null) tb.durEl.textContent = ` (${evt.duration_ms}ms)`;
+}
+
+function appendInfoBubble(text) {
+    const container = document.getElementById('chatContainer');
+    const wrap = document.createElement('div');
+    wrap.className = 'info-bubble';
+    wrap.textContent = text;
+    container.appendChild(wrap);
+}
+
+function renderMarkdown(text) {
+    let html = escapeHtml(text);
+    html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
+    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+    return html;
 }
 
 function appendMessage(role, content) {

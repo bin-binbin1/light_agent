@@ -11,6 +11,8 @@ import hashlib
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 
+from .dialect import get_dialect
+
 
 @dataclass
 class MemoryConfig:
@@ -20,6 +22,7 @@ class MemoryConfig:
     keep_ratio: float = 0.3           # 精简时保留最近消息的比例
     idle_compress_hours: float = 6    # 闲置超过此小时数且未压缩过时触发
     rag_top_k: int = 5                # RAG 检索返回条数
+    dialect: str = "sqlite"           # SQL 方言: sqlite / mysql
 
 
 class Memory:
@@ -29,67 +32,81 @@ class Memory:
         self.config = config
         self.llm = llm
         self.embedding_fn = embedding_fn  # 可选的 embedding 函数
+        self._d = get_dialect(config.dialect)
+        self._ph = self._d["placeholder"]
         self.conn = sqlite3.connect(config.db_path, check_same_thread=False)
         self._current_session: Optional[str] = None
         self._init_db()
+        self._maybe_migrate_keyword_index()
 
     def _init_db(self):
-        self.conn.executescript("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                session_id TEXT PRIMARY KEY,
-                user_id TEXT,
+        pk = self._d["autoincrement_pk"]  # sqlite: "INTEGER PRIMARY KEY AUTOINCREMENT" / mysql: "BIGINT PRIMARY KEY AUTO_INCREMENT"
+        stmts = [
+            """CREATE TABLE IF NOT EXISTS sessions (
+                session_id VARCHAR(64) PRIMARY KEY,
+                user_id VARCHAR(64),
                 created_at REAL,
                 updated_at REAL,
                 context_window INTEGER DEFAULT 128000
-            );
-
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT,
-                user_id TEXT,
-                role TEXT,
+            )""",
+            f"""CREATE TABLE IF NOT EXISTS messages (
+                id {pk},
+                session_id VARCHAR(64),
+                user_id VARCHAR(64),
+                role VARCHAR(32),
                 content TEXT,
                 tool_calls TEXT,
-                tool_call_id TEXT,
-                timestamp REAL,
-                FOREIGN KEY (session_id) REFERENCES sessions(session_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS summaries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT,
-                user_id TEXT,
+                tool_call_id VARCHAR(128),
+                timestamp REAL
+            )""",
+            f"""CREATE TABLE IF NOT EXISTS summaries (
+                id {pk},
+                session_id VARCHAR(64),
+                user_id VARCHAR(64),
                 summary TEXT,
                 message_range_start INTEGER,
                 message_range_end INTEGER,
-                timestamp REAL,
-                FOREIGN KEY (session_id) REFERENCES sessions(session_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS message_index (
+                timestamp REAL
+            )""",
+            # 老索引表（保留用于迁移回填，后续不再写入）
+            """CREATE TABLE IF NOT EXISTS message_index (
                 message_id INTEGER PRIMARY KEY,
-                session_id TEXT,
-                user_id TEXT,
+                session_id VARCHAR(64),
+                user_id VARCHAR(64),
                 keywords TEXT,
-                chunk_index INTEGER,
-                FOREIGN KEY (message_id) REFERENCES messages(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS context_snapshots (
-                session_id TEXT PRIMARY KEY,
-                user_id TEXT,
+                chunk_index INTEGER
+            )""",
+            # 新独立倒排表：每个关键词一行，可走 B-Tree 精确索引
+            f"""CREATE TABLE IF NOT EXISTS keyword_index (
+                id {pk},
+                keyword VARCHAR(64) NOT NULL,
+                message_id INTEGER NOT NULL,
+                session_id VARCHAR(64) NOT NULL,
+                user_id VARCHAR(64) NOT NULL
+            )""",
+            "CREATE INDEX IF NOT EXISTS ix_ki_lookup ON keyword_index(user_id, session_id, keyword)",
+            "CREATE INDEX IF NOT EXISTS ix_ki_msg ON keyword_index(message_id)",
+            """CREATE TABLE IF NOT EXISTS context_snapshots (
+                session_id VARCHAR(64) PRIMARY KEY,
+                user_id VARCHAR(64),
                 context TEXT,
                 updated_at REAL
-            );
-        """)
+            )""",
+        ]
+        if self._d["supports_executescript"]:
+            self.conn.executescript(";\n".join(stmts))
+        else:
+            for s in stmts:
+                self.conn.execute(s)
         self.conn.commit()
 
     # ─── 会话管理 ───
 
     def create_session(self, session_id: str, context_window: int = 128000, user_id: str = "default_user"):
         now = time.time()
+        ph = self._ph
         self.conn.execute(
-            "INSERT OR IGNORE INTO sessions (session_id, user_id, created_at, updated_at, context_window) VALUES (?, ?, ?, ?, ?)",
+            f"{self._d['insert_or_ignore']} INTO sessions (session_id, user_id, created_at, updated_at, context_window) VALUES ({ph}, {ph}, {ph}, {ph}, {ph})",
             (session_id, user_id, now, now, context_window)
         )
         self.conn.commit()
@@ -100,16 +117,18 @@ class Memory:
 
     def get_user_id(self, session_id: str) -> str:
         """从 session_id 获取 user_id"""
+        ph = self._ph
         cursor = self.conn.execute(
-            "SELECT user_id FROM sessions WHERE session_id = ?",
+            f"SELECT user_id FROM sessions WHERE session_id = {ph}",
             (session_id,)
         )
         result = cursor.fetchone()
         return result[0] if result else "default_user"
 
     def touch_session(self, session_id: str):
+        ph = self._ph
         self.conn.execute(
-            "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+            f"UPDATE sessions SET updated_at = {ph} WHERE session_id = {ph}",
             (time.time(), session_id)
         )
         self.conn.commit()
@@ -122,8 +141,9 @@ class Memory:
         now = time.time()
         tc_json = json.dumps(tool_calls) if tool_calls else None
         user_id = self.get_user_id(session_id)
+        ph = self._ph
         cursor = self.conn.execute(
-            "INSERT INTO messages (session_id, user_id, role, content, tool_calls, tool_call_id, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            f"INSERT INTO messages (session_id, user_id, role, content, tool_calls, tool_call_id, timestamp) VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})",
             (session_id, user_id, role, content, tc_json, tool_call_id, now)
         )
         msg_id = cursor.lastrowid
@@ -132,29 +152,105 @@ class Memory:
         if role in ("user", "assistant") and content:
             self._index_message(msg_id, session_id, content)
 
-        self.conn.execute("UPDATE sessions SET updated_at = ? WHERE session_id = ?", (now, session_id))
+        self.conn.execute(
+            f"UPDATE sessions SET updated_at = {ph} WHERE session_id = {ph}",
+            (now, session_id)
+        )
         self.conn.commit()
 
-    def _index_message(self, msg_id: int, session_id: str, content: str):
-        """为消息建立关键词索引"""
-        user_id = self.get_user_id(session_id)
-        # 简单分词：按标点和空格切分，保留有意义的词
+    @staticmethod
+    def _tokenize(content: str) -> List[str]:
+        """统一分词逻辑：中文连续串 / 英文串 / 数字，过滤长度 <= 1 的词，最多 50 个"""
         import re
         words = re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z]+|\d+(?:\.\d+)?', content.lower())
-        # 过滤太短的词
-        keywords = [w for w in words if len(w) > 1]
-        if keywords:
-            keywords_str = "|".join(keywords[:50])  # 最多50个关键词
-            self.conn.execute(
-                "INSERT OR REPLACE INTO message_index (message_id, session_id, user_id, keywords) VALUES (?, ?, ?, ?)",
-                (msg_id, session_id, user_id, keywords_str)
+        # 去重保序
+        seen = set()
+        kws = []
+        for w in words:
+            if len(w) > 1 and w not in seen:
+                seen.add(w)
+                kws.append(w)
+                if len(kws) >= 50:
+                    break
+        return kws
+
+    def _index_message(self, msg_id: int, session_id: str, content: str):
+        """为消息建立关键词索引（写独立倒排表 keyword_index）
+
+        策略：先删除该 msg_id 的旧行（兼容 SQLite/MySQL 双库，不用 upsert），
+        再批量 executemany 插入每个 keyword 一行。
+        """
+        user_id = self.get_user_id(session_id)
+        keywords = self._tokenize(content)
+        if not keywords:
+            return
+        ph = self._ph
+        # 先删（幂等，便于重复建索引）
+        self.conn.execute(
+            f"DELETE FROM keyword_index WHERE message_id = {ph}",
+            (msg_id,)
+        )
+        rows = [(kw, msg_id, session_id, user_id) for kw in keywords]
+        self.conn.executemany(
+            f"INSERT INTO keyword_index (keyword, message_id, session_id, user_id) VALUES ({ph}, {ph}, {ph}, {ph})",
+            rows
+        )
+
+    def _maybe_migrate_keyword_index(self):
+        """首次启动检测：若新表 keyword_index 空而老表 message_index 非空，一次性回填。
+
+        幂等：完成后新表非空，下次启动不再触发。
+        """
+        try:
+            row = self.conn.execute("SELECT 1 FROM keyword_index LIMIT 1").fetchone()
+            if row:
+                return  # 新表已有数据，跳过
+            row = self.conn.execute("SELECT 1 FROM message_index LIMIT 1").fetchone()
+            if not row:
+                return  # 老表也空，无需迁移
+        except Exception:
+            return  # 表可能还不存在（极早期），静默跳过
+
+        ph = self._ph
+        cursor = self.conn.execute(
+            "SELECT message_id, session_id, user_id, keywords FROM message_index"
+        )
+        total = 0
+        batch: List[Tuple] = []
+        for msg_id, sid, uid, kws_str in cursor.fetchall():
+            if not kws_str:
+                continue
+            for kw in kws_str.split("|"):
+                kw = kw.strip()
+                if len(kw) > 1:
+                    batch.append((kw, msg_id, sid, uid or "default_user"))
+            if len(batch) >= 500:
+                self.conn.executemany(
+                    f"INSERT INTO keyword_index (keyword, message_id, session_id, user_id) VALUES ({ph}, {ph}, {ph}, {ph})",
+                    batch
+                )
+                total += len(batch)
+                batch = []
+        if batch:
+            self.conn.executemany(
+                f"INSERT INTO keyword_index (keyword, message_id, session_id, user_id) VALUES ({ph}, {ph}, {ph}, {ph})",
+                batch
             )
+            total += len(batch)
+        self.conn.commit()
+        if total > 0:
+            try:
+                from .agent_logging import default_logger as _lg
+                _lg.system(f"keyword_index migrated {total} rows from message_index")
+            except Exception:
+                pass
 
     def get_all_messages(self, session_id: str) -> List[Dict]:
         """获取全量消息"""
         user_id = self.get_user_id(session_id)
+        ph = self._ph
         rows = self.conn.execute(
-            "SELECT role, content, tool_calls, tool_call_id FROM messages WHERE session_id = ? AND user_id = ? ORDER BY id ASC",
+            f"SELECT role, content, tool_calls, tool_call_id FROM messages WHERE session_id = {ph} AND user_id = {ph} ORDER BY id ASC",
             (session_id, user_id)
         ).fetchall()
         return self._rows_to_messages(rows)
@@ -166,8 +262,9 @@ class Memory:
         total = self.get_message_count(session_id)
         keep_count = max(int(total * ratio), 6)
 
+        ph = self._ph
         rows = self.conn.execute(
-            "SELECT role, content, tool_calls, tool_call_id FROM messages WHERE session_id = ? AND user_id = ? ORDER BY id DESC LIMIT ?",
+            f"SELECT role, content, tool_calls, tool_call_id FROM messages WHERE session_id = {ph} AND user_id = {ph} ORDER BY id DESC LIMIT {ph}",
             (session_id, user_id, keep_count)
         ).fetchall()
         rows.reverse()
@@ -186,8 +283,9 @@ class Memory:
 
     def get_message_count(self, session_id: str) -> int:
         user_id = self.get_user_id(session_id)
+        ph = self._ph
         row = self.conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ? AND user_id = ?",
+            f"SELECT COUNT(*) FROM messages WHERE session_id = {ph} AND user_id = {ph}",
             (session_id, user_id)
         ).fetchone()
         return row[0]
@@ -204,8 +302,9 @@ class Memory:
         return int(total)
 
     def should_compress(self, session_id: str, context: List[Dict] = None) -> bool:
+        ph = self._ph
         row = self.conn.execute(
-            "SELECT context_window FROM sessions WHERE session_id = ?",
+            f"SELECT context_window FROM sessions WHERE session_id = {ph}",
             (session_id,)
         ).fetchone()
         if not row:
@@ -222,8 +321,9 @@ class Memory:
 
         if self.has_been_compressed(session_id):
             return False
+        ph = self._ph
         row = self.conn.execute(
-            "SELECT updated_at FROM sessions WHERE session_id = ?",
+            f"SELECT updated_at FROM sessions WHERE session_id = {ph}",
             (session_id,)
         ).fetchone()
         if not row:
@@ -233,8 +333,9 @@ class Memory:
 
     def has_been_compressed(self, session_id: str) -> bool:
         user_id = self.get_user_id(session_id)
+        ph = self._ph
         row = self.conn.execute(
-            "SELECT COUNT(*) FROM summaries WHERE session_id = ? AND user_id = ?",
+            f"SELECT COUNT(*) FROM summaries WHERE session_id = {ph} AND user_id = {ph}",
             (session_id, user_id)
         ).fetchone()
         return row[0] > 0
@@ -287,8 +388,9 @@ class Memory:
         messages = []
 
         # 最新摘要
+        ph = self._ph
         summary_row = self.conn.execute(
-            "SELECT summary FROM summaries WHERE session_id = ? AND user_id = ? ORDER BY id DESC LIMIT 1",
+            f"SELECT summary FROM summaries WHERE session_id = {ph} AND user_id = {ph} ORDER BY id DESC LIMIT 1",
             (session_id, user_id)
         ).fetchone()
         if summary_row:
@@ -307,16 +409,18 @@ class Memory:
         """将内存上下文快照存入 SQLite"""
         user_id = self.get_user_id(session_id)
         ctx_json = json.dumps(context, ensure_ascii=False)
+        ph = self._ph
         self.conn.execute(
-            "INSERT OR REPLACE INTO context_snapshots (session_id, user_id, context, updated_at) VALUES (?, ?, ?, ?)",
+            f"{self._d['insert_or_replace']} INTO context_snapshots (session_id, user_id, context, updated_at) VALUES ({ph}, {ph}, {ph}, {ph})",
             (session_id, user_id, ctx_json, time.time())
         )
         self.conn.commit()
 
     def load_context(self, session_id: str) -> List[Dict]:
         """从快照加载上下文，无快照则用 get_context_for_llm 兜底"""
+        ph = self._ph
         row = self.conn.execute(
-            "SELECT context FROM context_snapshots WHERE session_id = ?",
+            f"SELECT context FROM context_snapshots WHERE session_id = {ph}",
             (session_id,)
         ).fetchone()
         if row and row[0]:
@@ -325,8 +429,9 @@ class Memory:
 
     def delete_context_snapshot(self, session_id: str):
         """删除上下文快照"""
+        ph = self._ph
         self.conn.execute(
-            "DELETE FROM context_snapshots WHERE session_id = ?",
+            f"DELETE FROM context_snapshots WHERE session_id = {ph}",
             (session_id,)
         )
         self.conn.commit()
@@ -334,56 +439,63 @@ class Memory:
     # ─── RAG 检索 ───
 
     def search_messages(self, session_id: str, query: str, top_k: int = None) -> List[Dict]:
-        """关键词检索历史消息"""
+        """关键词检索历史消息（走独立倒排表 keyword_index）
+
+        步骤：
+        1. 对 query 分词，过滤短词
+        2. 在 keyword_index 上用 IN (...) + GROUP BY 聚合匹配分数（走 (user_id, session_id, keyword) 索引）
+        3. JOIN messages 拉回原文，按匹配度降序、再按 id 降序
+        """
         user_id = self.get_user_id(session_id)
         k = top_k or self.config.rag_top_k
 
-        import re
-        query_words = set(re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z]+|\d+(?:\.\d+)?', query.lower()))
-        query_words = {w for w in query_words if len(w) > 1}
-
+        query_words = list({w for w in self._tokenize(query)})
         if not query_words:
             return []
 
-        # 构造 LIKE 查询
-        conditions = []
-        params = [session_id, user_id]
-        for word in query_words:
-            conditions.append("mi.keywords LIKE ?")
-            params.append(f"%{word}%")
-
-        where = " OR ".join(conditions)
-
-        sql = f"""
-            SELECT m.id, m.role, m.content, m.timestamp, mi.keywords
-            FROM messages m
-            JOIN message_index mi ON m.id = mi.message_id
-            WHERE m.session_id = ? AND m.user_id = ? AND ({where})
-            ORDER BY m.id DESC
-            LIMIT ?
+        ph = self._ph
+        in_placeholders = ",".join([ph] * len(query_words))
+        # 先在倒排表上聚合分数（限制候选集 = k*3，避免全表聚合）
+        candidate_sql = f"""
+            SELECT ki.message_id, COUNT(DISTINCT ki.keyword) AS score
+            FROM keyword_index ki
+            WHERE ki.user_id = {ph} AND ki.session_id = {ph}
+              AND ki.keyword IN ({in_placeholders})
+            GROUP BY ki.message_id
+            ORDER BY score DESC, ki.message_id DESC
+            LIMIT {ph}
         """
-        params.append(k * 3)  # 多取一些，后面排序
+        params = [user_id, session_id] + query_words + [k * 3]
+        cand_rows = self.conn.execute(candidate_sql, params).fetchall()
+        if not cand_rows:
+            return []
 
-        rows = self.conn.execute(sql, params).fetchall()
+        msg_ids = [r[0] for r in cand_rows]
+        score_map = {r[0]: r[1] for r in cand_rows}
 
-        # 按关键词匹配度排序
-        scored = []
-        for msg_id, role, content, ts, keywords_str in rows:
-            kw_set = set(keywords_str.split("|")) if keywords_str else set()
-            score = len(query_words & kw_set)
-            scored.append((score, msg_id, role, content, ts))
+        # JOIN messages 拉原文
+        in_ids = ",".join([ph] * len(msg_ids))
+        msg_sql = f"""
+            SELECT id, role, content, timestamp
+            FROM messages
+            WHERE session_id = {ph} AND user_id = {ph} AND id IN ({in_ids})
+        """
+        msg_rows = self.conn.execute(msg_sql, [session_id, user_id] + msg_ids).fetchall()
 
-        scored.sort(key=lambda x: -x[0])
+        scored = [
+            (score_map.get(mid, 0), mid, role, content, ts)
+            for (mid, role, content, ts) in msg_rows
+        ]
+        # 按分数 DESC、id DESC（新消息优先）排序
+        scored.sort(key=lambda x: (-x[0], -x[1]))
 
         results = []
         seen_contents = set()
         for score, msg_id, role, content, ts in scored[:k]:
-            # 去重相似内容
-            content_short = content[:100]
+            content_short = (content or "")[:100]
             if content_short in seen_contents:
                 continue
             seen_contents.add(content_short)
-
             results.append({
                 "message_id": msg_id,
                 "role": role,
@@ -398,18 +510,19 @@ class Memory:
     def search_by_time(self, session_id: str, start_time: float = None,
                        end_time: float = None, limit: int = 20) -> List[Dict]:
         """按时间范围检索"""
-        conditions = ["session_id = ?"]
+        ph = self._ph
+        conditions = [f"session_id = {ph}"]
         params = [session_id]
 
         if start_time:
-            conditions.append("timestamp >= ?")
+            conditions.append(f"timestamp >= {ph}")
             params.append(start_time)
         if end_time:
-            conditions.append("timestamp <= ?")
+            conditions.append(f"timestamp <= {ph}")
             params.append(end_time)
 
         where = " AND ".join(conditions)
-        sql = f"SELECT role, content, timestamp FROM messages WHERE {where} ORDER BY id DESC LIMIT ?"
+        sql = f"SELECT role, content, timestamp FROM messages WHERE {where} ORDER BY id DESC LIMIT {ph}"
         params.append(limit)
 
         rows = self.conn.execute(sql, params).fetchall()
@@ -423,10 +536,12 @@ class Memory:
 
     def clear_session(self, session_id: str):
         user_id = self.get_user_id(session_id)
-        self.conn.execute("DELETE FROM message_index WHERE session_id = ? AND user_id = ?", (session_id, user_id))
-        self.conn.execute("DELETE FROM messages WHERE session_id = ? AND user_id = ?", (session_id, user_id))
-        self.conn.execute("DELETE FROM summaries WHERE session_id = ? AND user_id = ?", (session_id, user_id))
-        self.conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        ph = self._ph
+        self.conn.execute(f"DELETE FROM message_index WHERE session_id = {ph} AND user_id = {ph}", (session_id, user_id))
+        self.conn.execute(f"DELETE FROM keyword_index WHERE session_id = {ph} AND user_id = {ph}", (session_id, user_id))
+        self.conn.execute(f"DELETE FROM messages WHERE session_id = {ph} AND user_id = {ph}", (session_id, user_id))
+        self.conn.execute(f"DELETE FROM summaries WHERE session_id = {ph} AND user_id = {ph}", (session_id, user_id))
+        self.conn.execute(f"DELETE FROM sessions WHERE session_id = {ph}", (session_id,))
         self.conn.commit()
 
     def list_sessions(self) -> List[Dict]:
@@ -440,8 +555,9 @@ class Memory:
 
     def get_latest_session(self, user_id: str) -> Optional[str]:
         """获取用户最近活跃的 session_id"""
+        ph = self._ph
         row = self.conn.execute(
-            "SELECT session_id FROM sessions WHERE user_id = ? ORDER BY updated_at DESC LIMIT 1",
+            f"SELECT session_id FROM sessions WHERE user_id = {ph} ORDER BY updated_at DESC LIMIT 1",
             (user_id,)
         ).fetchone()
         return row[0] if row else None

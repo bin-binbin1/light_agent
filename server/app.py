@@ -6,6 +6,8 @@ Agent 对话 API + Web UI 静态文件 + OpenAI 中转代理
 import json
 import os
 import time
+import asyncio
+import dataclasses
 import threading
 from collections import OrderedDict
 from typing import Optional
@@ -23,6 +25,17 @@ from src.llm import LLMFactory, LLMType, Message
 from src.tools import create_default_tools
 from src.agent_logging import Logger, LogConfig, LogLevel
 from src.config import Config
+from src.events import AgentEvent
+
+
+def _event_to_frame(item) -> dict:
+    """把 achat_stream 产出（str 或 AgentEvent 子类）映射为前端可消费的 SSE 帧字典"""
+    if isinstance(item, str):
+        return {"type": "text", "content": item}
+    if isinstance(item, AgentEvent):
+        # AgentEvent 及其子类都是 dataclass，type 字段已内置
+        return dataclasses.asdict(item)
+    return {"type": "text", "content": str(item)}
 
 
 class LRUAgentCache:
@@ -82,6 +95,7 @@ def create_app(config_path: str = "config/config.json") -> Flask:
         compress_threshold=config.compress_threshold,
         keep_ratio=config.keep_ratio,
         idle_compress_hours=config.idle_compress_hours,
+        dialect=config.get("dialect", "sqlite"),
     )
 
     # Agent LRU 缓存
@@ -204,7 +218,10 @@ def create_app(config_path: str = "config/config.json") -> Flask:
 
     @app.route("/api/chat/stream", methods=["POST"])
     def chat_stream():
-        """流式输出"""
+        """真流式输出：驱动 agent.achat_stream()，透传 text / thinking / tool_call /
+        tool_result / retry / error / done 帧。每个请求在 Flask 同步视图线程里起一个
+        独立 asyncio event loop，waitress 多线程间互不干扰。
+        """
         data = request.json or {}
         user_id = data.get("user_id")
         session_id = data.get("session_id")
@@ -216,18 +233,40 @@ def create_app(config_path: str = "config/config.json") -> Flask:
         if not sm.get_session(session_id, user_id):
             sm.create_session(user_id, session_id=session_id)
 
-        def generate():
-            try:
-                agent = get_agent(user_id, session_id)
-                response = agent.chat(message)
-                sm.touch_session(session_id)
-                for char in response:
-                    yield f"data: {json.dumps({'content': char})}\n\n"
-                yield f"data: {json.dumps({'done': True})}\n\n"
-            except Exception as e:
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        agent = get_agent(user_id, session_id)
 
-        return Response(stream_with_context(generate()), mimetype="text/event-stream")
+        def generate():
+            loop = asyncio.new_event_loop()
+            agen = agent.achat_stream(message)
+            try:
+                while True:
+                    try:
+                        item = loop.run_until_complete(agen.__anext__())
+                    except StopAsyncIteration:
+                        break
+                    frame = _event_to_frame(item)
+                    yield f"data: {json.dumps(frame, ensure_ascii=False)}\n\n"
+                sm.touch_session(session_id)
+                yield 'data: {"type":"done"}\n\n'
+            except Exception as e:
+                logger.error(f"stream error: {e}")
+                err = {"type": "error", "message": str(e)}
+                yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+            finally:
+                try:
+                    loop.run_until_complete(agen.aclose())
+                except Exception:
+                    pass
+                loop.close()
+
+        return Response(
+            stream_with_context(generate()),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",  # 防 nginx 缓冲
+            },
+        )
 
     # ─── 消息历史 ───
 

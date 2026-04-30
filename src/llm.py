@@ -511,25 +511,12 @@ class XiaomiTTS:
         self.voice = voice
         self.audio_format = audio_format
 
-    def synthesize(self, text: str, voice: str = None, model: str = None,
-                   response_format: str = None, **_ignored) -> TTSResponse:
-        """文字转语音"""
+    def _post_tts(self, payload: dict, fmt: str) -> TTSResponse:
+        """发送 TTS 请求并解析 base64 音频，供 synthesize / synthesize_with_design 复用"""
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        fmt = response_format or self.audio_format
-        payload = {
-            "model": model or self.model,
-            "messages": [
-                {"role": "assistant", "content": text},
-            ],
-            "audio": {
-                "format": fmt,
-                "voice": voice or self.voice,
-            },
-        }
-
         response = requests.post(
             f"{self.base_url}/chat/completions",
             headers=headers,
@@ -546,7 +533,6 @@ class XiaomiTTS:
             )
         data = response.json()
 
-        # 尝试从常见位置提取 base64 音频
         audio_b64 = None
         try:
             msg = data["choices"][0]["message"]
@@ -562,6 +548,46 @@ class XiaomiTTS:
 
         audio_bytes = base64.b64decode(audio_b64)
         return TTSResponse(audio_data=audio_bytes, format=fmt)
+
+    def synthesize(self, text: str, voice: str = None, model: str = None,
+                   response_format: str = None, **_ignored) -> TTSResponse:
+        """文字转语音（固定音色）"""
+        fmt = response_format or self.audio_format
+        payload = {
+            "model": model or self.model,
+            "messages": [
+                {"role": "assistant", "content": text},
+            ],
+            "audio": {
+                "format": fmt,
+                "voice": voice or self.voice,
+            },
+        }
+        return self._post_tts(payload, fmt)
+
+    def synthesize_with_design(self, text: str, voice_description: str,
+                               model: str = None,
+                               response_format: str = None) -> TTSResponse:
+        """Voice Design 文字转语音
+
+        Args:
+            text: 要合成的文本
+            voice_description: 音色描述（自然语言，如 "Give me a young male tone."）
+            model: 覆盖默认模型（默认用 self.model，配置里改 tts_model 即可切到 voicedesign 模型）
+            response_format: 音频格式
+        """
+        fmt = response_format or self.audio_format
+        payload = {
+            "model": model or self.model,
+            "messages": [
+                {"role": "user", "content": voice_description},
+                {"role": "assistant", "content": text},
+            ],
+            "audio": {
+                "format": fmt,
+            },
+        }
+        return self._post_tts(payload, fmt)
 
 
 # ─── STT 专用接口 ───
