@@ -1,15 +1,14 @@
 """
 Light Agent - 命令行对话入口
 --------------------------------
-开箱即用:
-  1. 首次启动若 api_key 缺失,会引导你填写 provider / api_key / model
-  2. 之后的启动直接读 config/config.json
-  3. 支持环境变量覆盖: {PROVIDER}_API_KEY (如 OPENAI_API_KEY / DEEPSEEK_API_KEY)
+配置:
+  1. 编辑 config/config.json,填写 provider / model / 可选 api_key
+  2. api_key 建议用环境变量 (如 OPENAI_API_KEY / MIFY_KEY),也可直接写在 config 里
+  3. 缺少 model 或 api_key 时会打印清楚的错误并退出
 
 使用:
   python main.py                       # 默认 config/config.json
   python main.py my_config.json        # 指定配置
-  python main.py --reconfig            # 强制重新走一遍引导
 
 对话中的命令:
   /help    查看命令
@@ -30,13 +29,45 @@ _here = os.path.dirname(os.path.abspath(__file__))
 if _here not in sys.path:
     sys.path.insert(0, _here)
 
-from src.llm import LLMFactory
+# 加载 .env（就近找 light_agent/.env，其次项目根 .env）
+try:
+    from dotenv import load_dotenv
+    for _p in (os.path.join(_here, ".env"),
+               os.path.join(os.path.dirname(_here), ".env")):
+        if os.path.exists(_p):
+            load_dotenv(_p)
+            break
+except ImportError:
+    pass  # python-dotenv 是可选依赖
+
+from src.llm import LLMFactory, OpenAICompatibleLLM, LLMType
 from src.agent import Agent, AgentConfig
-from src.memory import MemoryConfig
+from src.memory import Memory, MemoryConfig
 from src.tools import create_default_tools
 from src.agent_logging import Logger, LogConfig, LogLevel, LogType
 from src.config import Config
 from src.events import AgentEvent, ThinkingEvent, ToolCallEvent, ToolResultEvent, RetryEvent, ErrorEvent
+
+
+# ─── 环境变量候选列表（按 provider 查） ──
+_ENV_KEY_NAMES = {
+    "xiaomi": ["MIFY_KEY"],
+    "openai": ["OPENAI_API_KEY"],
+    "deepseek": ["DEEPSEEK_API_KEY"],
+    "kimi": ["KIMI_API_KEY", "MOONSHOT_API_KEY"],
+    "minimax": ["MINIMAX_API_KEY"],
+    "grok": ["GROK_API_KEY", "XAI_API_KEY"],
+    "openrouter": ["OPENROUTER_API_KEY"],
+}
+
+
+def _get_env_key(provider: str) -> str:
+    """按 provider 查环境变量里是否有 key"""
+    for name in _ENV_KEY_NAMES.get(provider, [f"{provider.upper()}_API_KEY"]):
+        v = os.environ.get(name)
+        if v:
+            return v
+    return ""
 
 
 # ─── 终端颜色（ANSI,Windows 现代终端都支持）──
@@ -53,94 +84,84 @@ def _color(s: str, c: str) -> str:
     return f"{c}{s}{C_RESET}"
 
 
-# ─── 首次使用引导 ────────────────────────────────────────
-def _run_setup(config: Config):
-    """交互式让用户填 provider / api_key / model,写回 config"""
-    print(_color("\n━━━ 首次使用向导 ━━━", C_CYAN + C_BOLD))
-    print("先填几项基本信息，之后会自动写入 config 文件。\n")
-
-    providers = list(LLMFactory.PROVIDERS.keys())
-    print(_color("可用 provider:", C_BOLD))
-    for i, p in enumerate(providers, 1):
-        info = LLMFactory.PROVIDERS[p]
-        print(f"  {i}. {_color(p, C_GREEN)}  (默认模型: {info.get('default_model', '-')})")
-
-    # 选 provider
-    cur_provider = config.get("provider") or "openai"
-    while True:
-        raw = input(f"\n选择 provider (数字或名字，默认 {cur_provider}): ").strip()
-        if not raw:
-            provider = cur_provider
-            break
-        if raw.isdigit() and 1 <= int(raw) <= len(providers):
-            provider = providers[int(raw) - 1]
-            break
-        if raw in providers:
-            provider = raw
-            break
-        print(_color(f"  不认识 '{raw}',请重新输入。", C_YELLOW))
-
-    config.set("provider", provider)
-    default_model = LLMFactory.PROVIDERS[provider].get("default_model", "")
-
-    # 填 api_key（环境变量优先提示）
-    env_key_name = f"{provider.upper()}_API_KEY"
-    env_key_val = os.environ.get(env_key_name, "")
-    cur_key = config.get("api_key", "")
-
-    print(f"\n{_color('API Key', C_BOLD)} (provider={provider})")
-    if env_key_val:
-        print(f"  检测到环境变量 {env_key_name},将优先使用;直接回车保持当前 config 值。")
-    elif cur_key:
-        print(f"  当前 config 中已配置 (长度 {len(cur_key)}),直接回车保留。")
-    else:
-        print(f"  可直接粘贴,或在终端设置环境变量: export {env_key_name}=xxx 再重启。")
-
-    raw = input(f"  输入 api_key (回车跳过): ").strip()
-    if raw:
-        config.set("api_key", raw)
-
-    # 填 model
-    cur_model = config.get("model") or default_model
-    print(f"\n{_color('Model', C_BOLD)} (默认 {default_model})")
-    raw = input(f"  输入 model (回车用默认 '{cur_model}'): ").strip()
-    config.set("model", raw or cur_model)
-
-    # system_prompt 可选
-    cur_prompt = config.get("system_prompt") or "你是一个有用的 AI 助手。"
-    print(f"\n{_color('系统提示词 (system_prompt)', C_BOLD)}")
-    print(f"  当前: {cur_prompt[:60]}{'...' if len(cur_prompt) > 60 else ''}")
-    raw = input(f"  输入新的提示词 (回车保持不变): ").strip()
-    if raw:
-        config.set("system_prompt", raw)
-
-    config.save()
-    print(_color(f"\n✓ 配置已保存到 {config.config_path}\n", C_GREEN))
+def _resolve_api_key(config: Config) -> str:
+    """key 优先级: 环境变量 > config.api_key"""
+    return _get_env_key(config.provider) or config.get("api_key", "")
 
 
-def _ensure_api_key(config: Config, interactive: bool = True) -> bool:
-    """确保 api_key 可用;缺失且可交互就启动引导。返回是否可继续。"""
-    # Config.api_key 会自动读环境变量,所以这里用它判断
-    if config.api_key:
-        return True
+def _check_config(config: Config) -> bool:
+    """启动前检查 config 必填项，有问题就打印清楚的错误并返回 False"""
+    ok = True
 
-    if not interactive:
+    # model 必填
+    if not config.model:
         print(_color(
-            f"❌ 缺少 api_key。请设置环境变量 "
-            f"{config.provider.upper()}_API_KEY,或在 {config.config_path} 里填写 api_key 字段。",
+            f"❌ 缺少 model。请在 {config.config_path} 里填写 model 字段。",
             C_RED,
         ))
-        return False
+        ok = False
 
-    print(_color(f"⚠ 未检测到 {config.provider.upper()}_API_KEY 环境变量,"
-                 f"且 config 里 api_key 为空。", C_YELLOW))
-    _run_setup(config)
-    return bool(config.api_key)
+    # api_key: 环境变量 or config 二选一
+    if not _resolve_api_key(config):
+        env_names = _ENV_KEY_NAMES.get(
+            config.provider, [f"{config.provider.upper()}_API_KEY"]
+        )
+        print(_color(
+            f"❌ 缺少 api_key。请设置环境变量 {'/'.join(env_names)}，"
+            f"或在 {config.config_path} 里填写 api_key 字段。",
+            C_RED,
+        ))
+        ok = False
+
+    return ok
 
 
 # ─── 创建 Agent ──────────────────────────────────────────
-def _create_agent(config: Config) -> Agent:
-    llm = LLMFactory.create(config.provider, config.api_key, config.model or None)
+def create_agent(config: Config,
+                 resume: bool = True,
+                 session_id: str = "",
+                 user_id: str = "") -> Agent:
+    """根据 config 创建 Agent（仿照 src/my_agent.py 的 create_my_agent）
+
+    Args:
+        config: 已加载的 Config 对象
+        resume: True 时自动恢复该用户最近的 session
+        session_id: 指定 session_id（优先级最高）
+        user_id: 覆盖 config 的 user_id
+    """
+    # key: 环境变量 > config
+    api_key = _resolve_api_key(config)
+    if not api_key:
+        raise RuntimeError(
+            f"api_key 为空。请设置环境变量 "
+            f"{'/'.join(_ENV_KEY_NAMES.get(config.provider, [config.provider.upper() + '_API_KEY']))} "
+            f"或在 {config.config_path} 里填 api_key。"
+        )
+
+    # LLM：如果 config 里给了 base_url，就直接走 OpenAICompatibleLLM；否则用 LLMFactory
+    base_url = config.get("base_url", "")
+    if base_url or config.provider not in LLMFactory.PROVIDERS:
+        llm = OpenAICompatibleLLM(
+            api_key=api_key,
+            model=config.model,
+            base_url=base_url or "https://api.openai.com/v1",
+            vision_model=config.get("vision_model", ""),
+            capabilities=[LLMType.TEXT, LLMType.VISION] if config.get("vision_model") else [LLMType.TEXT],
+        )
+    else:
+        llm = LLMFactory.create(config.provider, api_key, config.model or None)
+
+    # user_id / session_id 解析
+    if not user_id:
+        user_id = config.get("user_id", "default_user")
+    db_path = config.get("memory_db", "memory.db")
+
+    if not session_id and resume:
+        mem = Memory(MemoryConfig(db_path=db_path, dialect=config.get("dialect", "sqlite")))
+        session_id = mem.get_latest_session(user_id) or ""
+        mem.close()
+        if session_id:
+            print(_color(f"[RESUME] 恢复历史会话: {session_id}", C_DIM))
 
     agent_config = AgentConfig(
         name=config.get("name", "assistant"),
@@ -149,22 +170,22 @@ def _create_agent(config: Config) -> Agent:
         temperature=config.get("temperature", 0.7),
         max_tokens=config.get("max_tokens", 4096),
         memory_config=MemoryConfig(
-            db_path=config.get("memory_db", "memory.db"),
+            db_path=db_path,
             compress_threshold=config.compress_threshold,
             keep_ratio=config.keep_ratio,
             idle_compress_hours=config.idle_compress_hours,
             dialect=config.get("dialect", "sqlite"),
         ),
         debug=config.get("debug", False),
-        user_id=config.get("user_id", "default_user"),
-        session_id=config.get("session_id", ""),
+        user_id=user_id,
+        session_id=session_id,
     )
 
     logger = Logger(LogConfig(
         level=LogLevel.DEBUG if config.get("debug", False) else LogLevel.INFO,
         colorize=config.get("colorize", True),
     ))
-    # 不打印 response 日志（我们自己在终端渲染）
+    # 不打印 response 日志（终端里我们自己流式渲染）
     logger.disable(LogType.RESPONSE)
 
     tools = create_default_tools()
@@ -268,36 +289,29 @@ async def _chat_loop(agent: Agent, config: Config):
 
 
 # ─── 入口 ────────────────────────────────────────────────
-def _parse_args(argv):
-    """返回 (config_path, reconfig_flag)"""
+def _parse_args(argv) -> str:
+    """返回 config_path"""
     config_path = "config/config.json"
-    reconfig = False
     for arg in argv[1:]:
-        if arg in ("--reconfig", "-r"):
-            reconfig = True
-        elif arg in ("-h", "--help"):
+        if arg in ("-h", "--help"):
             print(__doc__)
             sys.exit(0)
         elif not arg.startswith("-"):
             config_path = arg
-    return config_path, reconfig
+    return config_path
 
 
 def main():
-    config_path, reconfig = _parse_args(sys.argv)
+    config_path = _parse_args(sys.argv)
 
     # Config 会在文件不存在时自动写入 DEFAULT_CONFIG
     config = Config(config_path)
 
-    # 强制重新配置
-    if reconfig:
-        _run_setup(config)
-
-    # 检查并引导 api_key
-    if not _ensure_api_key(config):
+    # 必填项校验：缺 model 或 api_key 就直接退出并提示
+    if not _check_config(config):
         sys.exit(1)
 
-    agent = _create_agent(config)
+    agent = create_agent(config)
     try:
         asyncio.run(_chat_loop(agent, config))
     finally:
