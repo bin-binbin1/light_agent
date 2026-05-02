@@ -1,0 +1,18 @@
+# Light Agent 依赖清单
+# 快速安装: pip install -r requirements.txt
+#
+# Python 版本要求: >= 3.9
+
+# ── 核心依赖（必须） ──
+requests>=2.31.0              # LLM API 同步调用
+httpx>=0.27.0                 # LLM API 异步流式调用
+
+# ── 环境变量加载（支持 .env 文件存放 API Key） ──
+python-dotenv>=1.0.0          # main.py 启动时自动加载项目根目录的 .env
+
+# ── HTTP 服务 + Web UI（仅启动 server 时需要） ──
+fastapi>=0.115.0              # server/app.py 使用的异步 Web 框架
+uvicorn[standard]>=0.30.0     # ASGI 服务器（server/run.py 启动）
+
+# ── Windows 命令行历史支持（main.py 在 Windows 下需要） ──
+pyreadline3>=3.4.1; sys_platform == "win32"

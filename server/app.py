@@ -1,354 +1,401 @@
 """
-App 模块 - Flask HTTP 服务
-Agent 对话 API + Web UI 静态文件 + OpenAI 中转代理
+Light Agent - FastAPI 服务端
+支持用户名登录、流式对话（SSE）、会话管理
+
+接口返回约定：
+  所有 JSON 端点统一返回 {"code": int, "msg": str, "data": Any}
+  - code=0    表示成功，msg="ok"，data 为业务数据
+  - code!=0   表示失败，通常等于 HTTP 状态码，msg 为错误描述，data 为 null 或补充信息
+
+例外：
+  - /agent/chat 是 SSE 流式事件（event:/data: 协议），不做外层包装
+  - /agent/index 返回 HTML，/agent/static/* 返回静态资源，均不包装
 """
 
-import json
+from __future__ import annotations
+
 import os
+import sys
+import uuid
 import time
+import sqlite3
 import asyncio
+import hashlib
 import dataclasses
-import threading
-from collections import OrderedDict
-from typing import Optional
+import json as _json
+from typing import Any
+from datetime import datetime
+from contextlib import asynccontextmanager
+
+# 确保项目根目录在 sys.path，允许 `from src.xxx` 导入
+_here = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.dirname(_here)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 try:
-    from flask import Flask, request, jsonify, Response, stream_with_context, send_from_directory
-    HAS_FLASK = True
+    from dotenv import load_dotenv
+    for _p in (os.path.join(_project_root, ".env"),
+               os.path.join(os.path.dirname(_project_root), ".env")):
+        if os.path.exists(_p):
+            load_dotenv(_p)
+            break
 except ImportError:
-    HAS_FLASK = False
+    pass
 
-from src.session import SessionManager
-from src.agent import Agent, AgentConfig
-from src.memory import MemoryConfig
-from src.llm import LLMFactory, LLMType, Message
-from src.tools import create_default_tools
-from src.agent_logging import Logger, LogConfig, LogLevel
+from fastapi import FastAPI, Depends, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
 from src.config import Config
 from src.events import AgentEvent
 
 
-def _event_to_frame(item) -> dict:
-    """把 achat_stream 产出（str 或 AgentEvent 子类）映射为前端可消费的 SSE 帧字典"""
-    if isinstance(item, str):
-        return {"type": "text", "content": item}
-    if isinstance(item, AgentEvent):
-        # AgentEvent 及其子类都是 dataclass，type 字段已内置
-        return dataclasses.asdict(item)
-    return {"type": "text", "content": str(item)}
+# ─── 常量 ───
+
+CONFIG_PATH = os.getenv("LIGHT_AGENT_CONFIG", "config/config.json")
+USER_DB_PATH = os.getenv("USER_DB_PATH", "data/users.db")
+WEB_DIR = os.path.join(_project_root, "web")
+IDLE_TIMEOUT = int(os.getenv("LIGHT_AGENT_IDLE_TIMEOUT", "1800"))          # 30 分钟
+TOKEN_TTL_SECONDS = int(os.getenv("LIGHT_AGENT_TOKEN_TTL", str(7 * 86400)))  # 7 天
 
 
-class LRUAgentCache:
-    """线程安全的 LRU Agent 缓存，淘汰时自动释放资源"""
+# ─── 统一返回格式 ───
 
-    def __init__(self, max_size: int = 500):
-        self._cache: OrderedDict = OrderedDict()
-        self._lock = threading.Lock()
-        self._max_size = max_size
-
-    def get(self, key: str) -> Optional[Agent]:
-        with self._lock:
-            if key in self._cache:
-                self._cache.move_to_end(key)
-                return self._cache[key]
-            return None
-
-    def put(self, key: str, agent: Agent):
-        with self._lock:
-            if key in self._cache:
-                self._cache.move_to_end(key)
-                self._cache[key] = agent
-            else:
-                if len(self._cache) >= self._max_size:
-                    _, evicted = self._cache.popitem(last=False)
-                    self._cleanup(evicted)
-                self._cache[key] = agent
-
-    def _cleanup(self, agent: Agent):
-        """释放被淘汰 Agent 持有的资源"""
-        try:
-            if hasattr(agent, 'memory') and hasattr(agent.memory, 'close'):
-                agent.memory.close()
-        except Exception:
-            pass
+def ok(data: Any = None, msg: str = "ok") -> dict:
+    return {"code": 0, "msg": msg, "data": data}
 
 
-def create_app(config_path: str = "config/config.json") -> Flask:
-    """创建 Flask 应用"""
-    if not HAS_FLASK:
-        raise ImportError("需要安装 Flask: pip install flask")
+def err(code: int, msg: str, data: Any = None) -> dict:
+    return {"code": code, "msg": msg, "data": data}
 
-    app = Flask(__name__)
-    config = Config(config_path)
 
-    # Web UI 静态文件目录
-    web_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
+# ─── 全局状态（进程内共享） ───
 
-    # 初始化
-    log_config = LogConfig(
-        level=LogLevel.DEBUG if config.get("debug") else LogLevel.INFO
-    )
-    logger = Logger(log_config)
+_agent_pool: dict = {}          # username -> Agent
+_agent_locks: dict = {}         # username -> asyncio.Lock（同一用户的 chat/reset/logout 串行化）
+_last_active: dict = {}         # username -> timestamp
+_pool_lock: asyncio.Lock | None = None   # agent 创建并发保护，lifespan 里懒初始化
 
-    sm = SessionManager(
-        db_path=config.get("memory_db", "memory.db"),
-        compress_threshold=config.compress_threshold,
-        keep_ratio=config.keep_ratio,
-        idle_compress_hours=config.idle_compress_hours,
-        dialect=config.get("dialect", "sqlite"),
-    )
 
-    # Agent LRU 缓存
-    _agent_cache = LRUAgentCache(max_size=config.get("agent_cache_size", 500))
+# ─── 用户 / Token DB ───
 
-    def get_agent(user_id: str, session_id: str) -> Agent:
-        cache_key = f"{user_id}:{session_id}"
-        agent = _agent_cache.get(cache_key)
-        if agent is None:
-            llm = LLMFactory.create(config.provider, config.api_key, config.model or None)
-            mem = sm.get_memory(user_id, session_id, llm=llm)
-            agent_config = AgentConfig(
-                name=config.get("name", "assistant"),
-                system_prompt=config.get("system_prompt", ""),
-                context_window=config.context_window,
-                temperature=config.get("temperature", 0.7),
-                max_tokens=config.get("max_tokens", 4096),
+def _init_user_db() -> None:
+    os.makedirs(os.path.dirname(USER_DB_PATH) or ".", exist_ok=True)
+    conn = sqlite3.connect(USER_DB_PATH)
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                username   TEXT PRIMARY KEY,
+                created_at REAL
             )
-            agent = Agent(llm, agent_config, tools=create_default_tools(memory=mem), logger=logger)
-            agent.memory = mem
-            agent.session_id = session_id
-            _agent_cache.put(cache_key, agent)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tokens (
+                token      TEXT PRIMARY KEY,
+                username   TEXT NOT NULL,
+                created_at REAL,
+                FOREIGN KEY (username) REFERENCES users(username)
+            )
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _user_db() -> sqlite3.Connection:
+    return sqlite3.connect(USER_DB_PATH)
+
+
+def _generate_token(username: str) -> str:
+    raw = f"{username}:{uuid.uuid4().hex}:{time.time()}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _verify_token(token: str) -> str:
+    conn = _user_db()
+    try:
+        row = conn.execute(
+            "SELECT username FROM tokens WHERE token = ?", (token,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=401, detail="无效或过期的 token")
+    return row[0]
+
+
+async def get_current_user(token: str = Query(..., description="登录返回的 token")) -> str:
+    return _verify_token(token)
+
+
+# ─── Agent 池 ───
+
+def _create_agent_sync(username: str):
+    """同步创建 Agent（阻塞）。每次调用重读 config.json，保证热更新生效"""
+    config = Config(CONFIG_PATH)
+    return config.create_agent_from_config(
+        resume=True,
+        session_id="",
+        user_id=username,
+    )
+
+
+async def _aget_or_create_agent(username: str):
+    """取/造该用户的 Agent。首次创建走线程池避免阻塞 event loop，并加 pool lock 防并发重建"""
+    _last_active[username] = time.time()
+    if username in _agent_pool:
+        return _agent_pool[username]
+
+    assert _pool_lock is not None, "Pool lock 未初始化（应由 lifespan 注入）"
+    async with _pool_lock:
+        if username in _agent_pool:   # double-check
+            return _agent_pool[username]
+        agent = await asyncio.to_thread(_create_agent_sync, username)
+        _agent_pool[username] = agent
+        _agent_locks[username] = asyncio.Lock()
         return agent
 
-    # ─── Web UI 静态文件 ───
 
-    @app.route("/")
-    def index():
-        return send_from_directory(web_dir, "index.html")
-
-    @app.route("/<path:filename>")
-    def static_files(filename):
-        return send_from_directory(web_dir, filename)
-
-    # ─── 健康检查 ───
-
-    @app.route("/api/health", methods=["GET"])
-    def health():
-        return jsonify({"status": "ok", "time": time.time()})
-
-    # ─── 用户管理 ───
-
-    @app.route("/api/users", methods=["POST"])
-    def create_user():
-        data = request.json or {}
-        user_id = data.get("user_id")
-        display_name = data.get("display_name", "")
-        if not user_id:
-            return jsonify({"error": "user_id required"}), 400
-        sm.ensure_user(user_id, display_name)
-        return jsonify({"ok": True, "user_id": user_id})
-
-    @app.route("/api/users", methods=["GET"])
-    def list_users():
-        users = sm.list_users()
-        return jsonify({"users": users})
-
-    @app.route("/api/users/<user_id>", methods=["GET"])
-    def get_user(user_id):
-        info = sm.get_user_info(user_id)
-        if not info:
-            return jsonify({"error": "user not found"}), 404
-        return jsonify(info)
-
-    # ─── 会话管理 ───
-
-    @app.route("/api/sessions", methods=["POST"])
-    def create_session():
-        data = request.json or {}
-        user_id = data.get("user_id")
-        if not user_id:
-            return jsonify({"error": "user_id required"}), 400
-
-        title = data.get("title", "")
-        context_window = data.get("context_window")
-        session_id = sm.create_session(user_id, title=title, context_window=context_window)
-        return jsonify({"ok": True, "session_id": session_id})
-
-    @app.route("/api/users/<user_id>/sessions", methods=["GET"])
-    def list_sessions(user_id):
-        sessions = sm.list_sessions(user_id)
-        return jsonify({"sessions": sessions})
-
-    @app.route("/api/sessions/<session_id>", methods=["GET"])
-    def get_session(session_id):
-        user_id = request.args.get("user_id")
-        info = sm.get_session(session_id, user_id)
-        if not info:
-            return jsonify({"error": "session not found"}), 404
-        return jsonify(info)
-
-    @app.route("/api/sessions/<session_id>", methods=["DELETE"])
-    def delete_session(session_id):
-        user_id = request.args.get("user_id")
-        sm.delete_session(session_id, user_id)
-        return jsonify({"ok": True})
-
-    # ─── 对话 ───
-
-    @app.route("/api/chat", methods=["POST"])
-    def chat():
-        data = request.json or {}
-        user_id = data.get("user_id")
-        session_id = data.get("session_id")
-        message = data.get("message", "")
-
-        if not user_id or not session_id or not message:
-            return jsonify({"error": "user_id, session_id, message required"}), 400
-
-        if not sm.get_session(session_id, user_id):
-            sm.create_session(user_id, session_id=session_id)
-
+def _remove_agent(username: str) -> None:
+    agent = _agent_pool.pop(username, None)
+    if agent is not None:
         try:
-            agent = get_agent(user_id, session_id)
-            response = agent.chat(message)
-            sm.touch_session(session_id)
-            return jsonify({"response": response})
+            agent.save_state()
         except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
-    @app.route("/api/chat/stream", methods=["POST"])
-    def chat_stream():
-        """真流式输出：驱动 agent.achat_stream()，透传 text / thinking / tool_call /
-        tool_result / retry / error / done 帧。每个请求在 Flask 同步视图线程里起一个
-        独立 asyncio event loop，waitress 多线程间互不干扰。
-        """
-        data = request.json or {}
-        user_id = data.get("user_id")
-        session_id = data.get("session_id")
-        message = data.get("message", "")
-
-        if not user_id or not session_id or not message:
-            return jsonify({"error": "user_id, session_id, message required"}), 400
-
-        if not sm.get_session(session_id, user_id):
-            sm.create_session(user_id, session_id=session_id)
-
-        agent = get_agent(user_id, session_id)
-
-        def generate():
-            loop = asyncio.new_event_loop()
-            agen = agent.achat_stream(message)
-            try:
-                while True:
-                    try:
-                        item = loop.run_until_complete(agen.__anext__())
-                    except StopAsyncIteration:
-                        break
-                    frame = _event_to_frame(item)
-                    yield f"data: {json.dumps(frame, ensure_ascii=False)}\n\n"
-                sm.touch_session(session_id)
-                yield 'data: {"type":"done"}\n\n'
-            except Exception as e:
-                logger.error(f"stream error: {e}")
-                err = {"type": "error", "message": str(e)}
-                yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
-            finally:
-                try:
-                    loop.run_until_complete(agen.aclose())
-                except Exception:
-                    pass
-                loop.close()
-
-        return Response(
-            stream_with_context(generate()),
-            mimetype="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",  # 防 nginx 缓冲
-            },
-        )
-
-    # ─── 消息历史 ───
-
-    @app.route("/api/sessions/<session_id>/messages", methods=["GET"])
-    def get_messages(session_id):
-        user_id = request.args.get("user_id")
-        if not user_id:
-            return jsonify({"error": "user_id required"}), 400
-
-        try:
-            mem = sm.get_memory(user_id, session_id)
-            messages = mem.get_all_messages(session_id)
-            return jsonify({"messages": messages})
-        except ValueError as e:
-            return jsonify({"error": str(e)}), 404
-
-    # ─── 记忆搜索 ───
-
-    @app.route("/api/search", methods=["POST"])
-    def search_memory():
-        data = request.json or {}
-        user_id = data.get("user_id")
-        session_id = data.get("session_id")
-        query = data.get("query", "")
-        top_k = data.get("top_k", 5)
-
-        if not user_id or not session_id or not query:
-            return jsonify({"error": "user_id, session_id, query required"}), 400
-
-        try:
-            mem = sm.get_memory(user_id, session_id)
-            results = mem.search_messages(session_id, query, top_k=top_k)
-            return jsonify({"results": results})
-        except ValueError as e:
-            return jsonify({"error": str(e)}), 404
-
-    # ─── 统计 ───
-
-    @app.route("/api/stats", methods=["GET"])
-    def stats():
-        user_id = request.args.get("user_id")
-        s = sm.get_stats(user_id)
-        return jsonify(s)
-
-    # ─── 注册中转代理 ───
-
-    from server.proxy import create_proxy_blueprint
-    proxy_bp = create_proxy_blueprint(config)
-    app.register_blueprint(proxy_bp)
-
-    return app
+            print(f"[warn] save_state failed for {username}: {e}", file=sys.stderr)
+    _agent_locks.pop(username, None)
+    _last_active.pop(username, None)
 
 
-def run_server(host: str = "0.0.0.0", port: int = 8000, config_path: str = "config/config.json",
-               debug: bool = False, workers: int = 4, server: str = "auto"):
-    """启动服务"""
-    app = create_app(config_path)
-    print(f"Light Agent Server: http://{host}:{port}")
-    print(f"   POST /api/chat            - Agent 对话")
-    print(f"   POST /api/chat/stream     - 流式对话")
-    print(f"   POST /v1/chat/completions - OpenAI 兼容中转")
-    print(f"   POST /api/sessions        - 创建会话")
-    print(f"   POST /api/users           - 创建用户")
-    print(f"   POST /api/search          - 搜索记忆")
-    print(f"   GET  /api/health          - 健康检查")
-    print(f"   GET  /                    - Web UI")
-
-    if server == "auto":
-        if debug:
-            server = "flask"
-        else:
-            try:
-                import waitress  # noqa: F401
-                server = "waitress"
-            except ImportError:
-                server = "flask"
-
-    if server == "waitress":
-        import waitress
-        print(f"   Server: waitress ({workers} threads)")
-        waitress.serve(app, host=host, port=port, threads=workers)
+async def _remove_agent_locked(username: str) -> None:
+    """拿到该用户 chat lock 后再释放 Agent，保证正在进行的 chat 流跑完"""
+    lock = _agent_locks.get(username)
+    if lock is not None:
+        async with lock:
+            _remove_agent(username)
     else:
-        if not debug:
-            print("   WARNING: Flask 开发服务器不适合生产环境，请安装 waitress: pip install waitress")
-        app.run(host=host, port=port, debug=debug)
+        _remove_agent(username)
+
+
+async def _cleanup_idle_agents() -> None:
+    while True:
+        await asyncio.sleep(300)
+        now = time.time()
+        idle = [u for u, t in list(_last_active.items()) if now - t > IDLE_TIMEOUT]
+        for username in idle:
+            await _remove_agent_locked(username)
+
+
+# ─── Lifespan ───
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _pool_lock
+    _init_user_db()
+    _pool_lock = asyncio.Lock()
+
+    cleanup_task = asyncio.create_task(_cleanup_idle_agents())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+        for username in list(_agent_pool.keys()):
+            _remove_agent(username)
+
+
+# ─── FastAPI App ───
+
+app = FastAPI(
+    title="Light Agent",
+    description="轻量 Agent 框架 · FastAPI 服务端",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+if os.path.isdir(WEB_DIR):
+    app.mount("/agent/static", StaticFiles(directory=WEB_DIR), name="static")
+
+
+# ─── 全局异常处理（统一包装成 {code,msg,data}） ───
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_exception_handler(request: Request, exc: StarletteHTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=err(exc.status_code, str(exc.detail)),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content=err(422, "参数校验失败", {"errors": exc.errors()}),
+    )
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    print(f"[unhandled] {type(exc).__name__}: {exc}", file=sys.stderr)
+    return JSONResponse(
+        status_code=500,
+        content=err(500, f"服务器内部错误: {type(exc).__name__}"),
+    )
+
+
+# ─── 请求模型 ───
+
+class LoginRequest(BaseModel):
+    username: str
+
+
+class ChatRequest(BaseModel):
+    message: str
+
+
+# ─── 接口 ───
+
+@app.post("/agent/login", summary="用户登录（仅用户名）")
+async def login(req: LoginRequest):
+    username = req.username.strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="用户名不能为空")
+
+    conn = _user_db()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO users (username, created_at) VALUES (?, ?)",
+            (username, time.time()),
+        )
+        conn.execute(
+            "DELETE FROM tokens WHERE username = ? AND created_at < ?",
+            (username, time.time() - TOKEN_TTL_SECONDS),
+        )
+        token = _generate_token(username)
+        conn.execute(
+            "INSERT INTO tokens (token, username, created_at) VALUES (?, ?, ?)",
+            (token, username, time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    agent = await _aget_or_create_agent(username)
+    return ok({
+        "token": token,
+        "username": username,
+        "session_id": agent.session_id,
+    })
+
+
+@app.post("/agent/logout", summary="退出登录")
+async def logout(username: str = Depends(get_current_user)):
+    await _remove_agent_locked(username)
+
+    conn = _user_db()
+    try:
+        conn.execute("DELETE FROM tokens WHERE username = ?", (username,))
+        conn.commit()
+    finally:
+        conn.close()
+    return ok(msg="已退出")
+
+
+def _sse(event_name: str, data_obj) -> str:
+    return f"event: {event_name}\ndata: {_json.dumps(data_obj, ensure_ascii=False)}\n\n"
+
+
+@app.post("/agent/chat", summary="对话（SSE 流式，不做 code/msg/data 包装）")
+async def chat(req: ChatRequest, username: str = Depends(get_current_user)):
+    message = req.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="消息不能为空")
+
+    send_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    message_with_time = f"[发送时间: {send_time}]\n{message}"
+
+    agent = await _aget_or_create_agent(username)
+    lock = _agent_locks[username]
+
+    async def event_stream():
+        async with lock:
+            try:
+                async for chunk in agent.achat_stream(message_with_time):
+                    if isinstance(chunk, AgentEvent):
+                        yield _sse(chunk.type, dataclasses.asdict(chunk))
+                    else:
+                        yield _sse("chunk", {"text": chunk})
+                yield _sse("done", {})
+            except Exception as e:
+                print(f"[chat stream error] {type(e).__name__}: {e}", file=sys.stderr)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/agent/reset", summary="重置对话")
+async def reset_session(username: str = Depends(get_current_user)):
+    agent = await _aget_or_create_agent(username)
+    lock = _agent_locks[username]
+    async with lock:
+        agent.reset()
+    return ok({"session_id": agent.session_id}, msg="对话已重置")
+
+
+@app.get("/agent/session", summary="当前会话信息")
+async def get_session(username: str = Depends(get_current_user)):
+    agent = await _aget_or_create_agent(username)
+    return ok({"username": username, "session_id": agent.session_id})
+
+
+@app.get("/agent/history", summary="当前会话历史")
+async def get_history(username: str = Depends(get_current_user)):
+    agent = await _aget_or_create_agent(username)
+    return ok({"messages": agent.get_history()})
+
+
+@app.post("/agent/reload", summary="[开发] 清空 agent pool，下次请求按最新 config 重建")
+async def reload_pool():
+    assert _pool_lock is not None
+    count = 0
+    async with _pool_lock:
+        for username in list(_agent_pool.keys()):
+            await _remove_agent_locked(username)
+            count += 1
+    return ok({"cleared": count}, msg=f"已清空 {count} 个 agent，下次请求按最新 config 重建")
+
+
+@app.get("/agent/index", response_class=HTMLResponse, summary="Web 聊天页面（HTML，不包装）")
+async def index_page():
+    html_path = os.path.join(WEB_DIR, "index.html")
+    if not os.path.exists(html_path):
+        raise HTTPException(status_code=404, detail="web/index.html 不存在")
+    return FileResponse(html_path, media_type="text/html")
+
+
+@app.get("/health", summary="健康检查")
+async def health():
+    return ok({"status": "ok", "users_online": len(_agent_pool)})

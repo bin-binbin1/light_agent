@@ -6,7 +6,19 @@
       "Bash(python -m pytest tests/ -x --tb=short)",
       "Bash(python -m pip install pytest -q)",
       "Bash(python -m pytest tests/ --tb=short)",
-      "Bash(python -m pip install flask -q)"
+      "Bash(python -m pip install flask -q)",
+      "Bash(pip install *)",
+      "Bash(python -c \"from server.app import app; print\\('Import OK, routes:'\\); [print\\('  ', r.methods, r.path\\) for r in app.routes if hasattr\\(r, 'path'\\)]\")",
+      "Bash(python server/run.py --port 18000 --log-level warning)",
+      "Bash(echo \"Started background server with PID $!\")",
+      "Bash(curl -s http://127.0.0.1:18000/health)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://127.0.0.1:18000/agent/session?token=bad)",
+      "Bash(curl -s -X POST http://127.0.0.1:18000/agent/login -H \"Content-Type: application/json\" -d '{\"username\":\"smoke\"}')",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://127.0.0.1:18000/agent/index)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://127.0.0.1:18000/agent/static/app.js)",
+      "Bash(kill %1)",
+      "Bash(wait)",
+      "Bash(git config *)"
     ]
   }
 }

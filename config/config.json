@@ -1,5 +1,5 @@
 {
-    "name": "safety_score_agent",
+    "name": "light_agent",
     "provider": "xiaomi",
     "api_key": "",
     "model": "xiaomi/mimo-v2.5-pro",
@@ -11,7 +11,7 @@
     "context_window": 128000,
     "temperature": 0.9,
     "max_tokens": 4096,
-    "memory_db": "my_agent_memory.db",
+    "memory_db": "data/server_memory.db",
     "compress_threshold": 0.8,
     "keep_ratio": 0.3,
     "idle_compress_hours": 0,

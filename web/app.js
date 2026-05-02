@@ -1,208 +1,203 @@
 // ─── Light Agent Web App ───
 
 const API = {
-    server: 'http://localhost:8000',
-    userId: 'web_user',
-
-    async request(method, path, body = null) {
-        const opts = {
-            method,
-            headers: { 'Content-Type': 'application/json' }
-        };
-        if (body) opts.body = JSON.stringify(body);
-        const res = await fetch(`${this.server}${path}`, opts);
-        return res.json();
-    },
-
-    get(path) { return this.request('GET', path); },
-    post(path, body) { return this.request('POST', path, body); },
-    del(path) { return this.request('DELETE', path); },
+    base: location.origin,
+    token: localStorage.getItem('la_token') || '',
+    username: localStorage.getItem('la_username') || '',
 };
 
-// ─── 状态 ───
-let currentSessionId = null;
-let sessions = [];
+// ─── 视图切换 ───
+function showLogin() {
+    document.getElementById('loginView').classList.remove('hidden');
+    document.getElementById('chatView').classList.add('hidden');
+    setTimeout(() => document.getElementById('usernameInput')?.focus(), 50);
+}
 
-// ─── 初始化 ───
-window.onload = () => {
-    loadSettings();
-    loadSessions();
+function showChat() {
+    document.getElementById('loginView').classList.add('hidden');
+    document.getElementById('chatView').classList.remove('hidden');
+    document.getElementById('currentUser').textContent = API.username;
+    setTimeout(() => document.getElementById('messageInput')?.focus(), 50);
+}
+
+// ─── 启动 ───
+window.onload = async () => {
+    if (API.token && API.username) {
+        try {
+            const r = await fetch(`${API.base}/agent/session?token=${encodeURIComponent(API.token)}`);
+            if (r.ok) {
+                showChat();
+                await loadHistory();
+                return;
+            }
+        } catch (_) { /* fall through to login */ }
+        localStorage.removeItem('la_token');
+        localStorage.removeItem('la_username');
+        API.token = '';
+        API.username = '';
+    }
+    showLogin();
 };
 
-// ─── 设置 ───
-function openSettings() {
-    document.getElementById('settingsModal').classList.add('show');
-    document.getElementById('settingServer').value = API.server;
-    document.getElementById('settingUserId').value = API.userId;
-}
+// ─── 登录 / 登出 ───
+async function login() {
+    const input = document.getElementById('usernameInput');
+    const errEl = document.getElementById('loginError');
+    const username = input.value.trim();
+    errEl.textContent = '';
 
-function closeSettings(e) {
-    if (e && e.target !== e.currentTarget) return;
-    document.getElementById('settingsModal').classList.remove('show');
-}
+    if (!username) {
+        errEl.textContent = '用户名不能为空';
+        return;
+    }
 
-function saveSettings() {
-    API.server = document.getElementById('settingServer').value || 'http://localhost:8000';
-    API.userId = document.getElementById('settingUserId').value || 'web_user';
-
-    const settings = {
-        server: API.server,
-        userId: API.userId,
-        provider: document.getElementById('settingProvider').value,
-        model: document.getElementById('settingModel').value,
-        apiKey: document.getElementById('settingApiKey').value,
-        systemPrompt: document.getElementById('settingPrompt').value,
-        contextWindow: document.getElementById('settingContext').value,
-        temperature: document.getElementById('settingTemp').value,
-    };
-
-    localStorage.setItem('light_agent_settings', JSON.stringify(settings));
-    closeSettings();
-    loadSessions();
-}
-
-function loadSettings() {
-    const saved = localStorage.getItem('light_agent_settings');
-    if (!saved) return;
-
-    const s = JSON.parse(saved);
-    API.server = s.server || 'http://localhost:8000';
-    API.userId = s.userId || 'web_user';
-
-    document.getElementById('settingServer').value = API.server;
-    document.getElementById('settingUserId').value = API.userId;
-    if (s.provider) document.getElementById('settingProvider').value = s.provider;
-    if (s.model) document.getElementById('settingModel').value = s.model;
-    if (s.apiKey) document.getElementById('settingApiKey').value = s.apiKey;
-    if (s.systemPrompt) document.getElementById('settingPrompt').value = s.systemPrompt;
-    if (s.contextWindow) document.getElementById('settingContext').value = s.contextWindow;
-    if (s.temperature) document.getElementById('settingTemp').value = s.temperature;
-}
-
-// ─── 会话管理 ───
-async function loadSessions() {
-    const res = await API.get(`/api/users/${API.userId}/sessions`);
-    sessions = res.sessions || [];
-    renderSessionList();
-}
-
-async function createSession() {
-    const res = await API.post('/api/sessions', {
-        user_id: API.userId,
-        title: '新对话'
-    });
-
-    if (res.session_id) {
-        await loadSessions();
-        selectSession(res.session_id);
+    try {
+        const r = await fetch(`${API.base}/agent/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username }),
+        });
+        const json = await r.json().catch(() => ({}));
+        if (!r.ok || json.code !== 0) {
+            errEl.textContent = json.msg || `登录失败 (HTTP ${r.status})`;
+            return;
+        }
+        const payload = json.data || {};
+        API.token = payload.token;
+        API.username = payload.username;
+        localStorage.setItem('la_token', API.token);
+        localStorage.setItem('la_username', API.username);
+        showChat();
+        clearChatContainer();
+        await loadHistory();
+    } catch (err) {
+        errEl.textContent = `网络错误: ${err.message}`;
     }
 }
 
-function selectSession(sessionId) {
-    currentSessionId = sessionId;
-    renderSessionList();
-    loadMessages();
-
-    const s = sessions.find(s => s.session_id === sessionId);
-    document.getElementById('sessionTitle').textContent = s ? s.title || '对话' : '对话';
+async function logout() {
+    if (!confirm('确定要退出登录？')) return;
+    try {
+        await fetch(`${API.base}/agent/logout?token=${encodeURIComponent(API.token)}`, {
+            method: 'POST',
+        });
+    } catch (_) { /* ignore */ }
+    localStorage.removeItem('la_token');
+    localStorage.removeItem('la_username');
+    API.token = '';
+    API.username = '';
+    clearChatContainer();
+    showLogin();
 }
 
-async function deleteSession(sessionId, e) {
-    e.stopPropagation();
-    if (!confirm('确定删除此对话？')) return;
-
-    await API.del(`/api/sessions/${sessionId}?user_id=${API.userId}`);
-
-    if (currentSessionId === sessionId) {
-        currentSessionId = null;
-        document.getElementById('chatContainer').innerHTML = `
-            <div class="welcome">
-                <h1>🤖 Light Agent</h1>
-                <p>轻量化 AI 对话助手</p>
-                <p class="hint">点击「新建对话」开始</p>
-            </div>`;
-        document.getElementById('sessionTitle').textContent = '选择或新建对话';
+async function resetSession() {
+    if (!confirm('重置后当前对话上下文会清空（历史消息仍在数据库中），确定？')) return;
+    try {
+        const r = await fetch(`${API.base}/agent/reset?token=${encodeURIComponent(API.token)}`, {
+            method: 'POST',
+        });
+        const json = await r.json().catch(() => ({}));
+        if (!r.ok || json.code !== 0) {
+            alert(`重置失败: ${json.msg || 'HTTP ' + r.status}`);
+            return;
+        }
+        clearChatContainer();
+        appendInfoBubble(json.msg || '对话已重置');
+    } catch (err) {
+        alert(`网络错误: ${err.message}`);
     }
-
-    await loadSessions();
 }
 
-function renderSessionList() {
-    const list = document.getElementById('sessionList');
-    list.innerHTML = sessions.map(s => `
-        <div class="session-item ${s.session_id === currentSessionId ? 'active' : ''}"
-             onclick="selectSession('${s.session_id}')">
-            <span class="title">${s.title || s.session_id}</span>
-            <button class="delete-btn" onclick="deleteSession('${s.session_id}', event)">×</button>
-        </div>
-    `).join('');
+function clearChatContainer() {
+    document.getElementById('chatContainer').innerHTML = '';
 }
 
-// ─── 消息 ───
-async function loadMessages() {
-    if (!currentSessionId) return;
-
-    const res = await API.get(`/api/sessions/${currentSessionId}/messages?user_id=${API.userId}`);
-    const messages = res.messages || [];
-
-    const container = document.getElementById('chatContainer');
-    container.innerHTML = messages.map(m => renderMessage(m.role, m.content)).join('');
-    scrollToBottom();
+// ─── 历史加载 ───
+async function loadHistory() {
+    try {
+        const r = await fetch(`${API.base}/agent/history?token=${encodeURIComponent(API.token)}`);
+        if (!r.ok) return;
+        const json = await r.json().catch(() => ({}));
+        if (json.code !== 0) return;
+        const messages = (json.data && json.data.messages) || [];
+        const container = document.getElementById('chatContainer');
+        if (!messages || messages.length === 0) {
+            container.innerHTML = `
+                <div class="welcome">
+                    <h1>🤖 Light Agent</h1>
+                    <p class="hint">开始新的对话吧</p>
+                </div>`;
+            return;
+        }
+        container.innerHTML = '';
+        for (const m of messages) {
+            if (m.role === 'user') {
+                appendMessage('user', m.content || '');
+            } else if (m.role === 'assistant') {
+                if (m.content) {
+                    appendMessage('assistant', m.content);
+                }
+                if (m.tool_calls && m.tool_calls.length) {
+                    for (const tc of m.tool_calls) {
+                        const name = (tc.function && tc.function.name) || tc.name || 'tool';
+                        const tb = appendToolBubble({ name, display: name });
+                        updateToolBubble(tb, { display: name, success: true });
+                    }
+                }
+            }
+            // role === 'tool'（工具返回结果）不单独展示，让 LLM 的下一条回复承载
+        }
+        scrollToBottom();
+    } catch (err) {
+        console.error('loadHistory failed:', err);
+    }
 }
 
-function renderMessage(role, content) {
-    // 简单 markdown 处理
-    let html = escapeHtml(content);
-    // 代码块
-    html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
-    // 行内代码
-    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-
-    return `
-        <div class="message ${role}">
-            <div class="role">${role === 'user' ? '👤 你' : '🤖 Agent'}</div>
-            <div class="content">${html}</div>
-        </div>`;
-}
-
+// ─── 发送消息（SSE 流式） ───
 async function sendMessage() {
     const input = document.getElementById('messageInput');
     const message = input.value.trim();
-    if (!message || !currentSessionId) return;
+    if (!message) return;
 
     input.value = '';
+    autoResize(input);
     const btn = document.getElementById('sendBtn');
     btn.disabled = true;
 
-    // 显示用户消息
+    // 隐藏欢迎提示
+    const welcome = document.getElementById('welcomeHint');
+    if (welcome) welcome.remove();
+
     appendMessage('user', message);
     scrollToBottom();
 
-    // 创建 assistant 气泡（内容稍后流式追加；先挂一个 loading 指示）
-    let asstBubble, asstContent;
-    ({ bubble: asstBubble, contentEl: asstContent } = appendAssistantBubble());
+    // 创建 assistant 气泡（先挂思考点点点）
+    let { bubble: asstBubble, contentEl: asstContent } = appendAssistantBubble();
     showThinking(asstBubble);
     scrollToBottom();
 
-    const toolMap = new Map();       // name -> {bubble, contentEl} 工具气泡追踪
-    let asstText = '';               // 当前 assistant 气泡累积的文本（工具调用后会重置）
-    let hasTextStarted = false;      // 当前 assistant 气泡是否已收到第一帧文本
+    const toolMap = new Map();
+    let asstText = '';
+    let hasTextStarted = false;
 
     try {
-        const resp = await fetch(`${API.server}/api/chat/stream`, {
+        const resp = await fetch(`${API.base}/agent/chat?token=${encodeURIComponent(API.token)}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                user_id: API.userId,
-                session_id: currentSessionId,
-                message: message,
-            }),
+            body: JSON.stringify({ message }),
         });
+
+        if (resp.status === 401) {
+            hideThinking(asstBubble);
+            asstContent.textContent = '❌ 登录已失效，请重新登录';
+            setTimeout(() => { localStorage.clear(); location.reload(); }, 1500);
+            return;
+        }
 
         if (!resp.ok || !resp.body) {
             hideThinking(asstBubble);
             asstContent.textContent = `❌ 连接失败: HTTP ${resp.status}`;
-            throw new Error(`HTTP ${resp.status}`);
+            return;
         }
 
         const reader = resp.body.getReader();
@@ -213,46 +208,41 @@ async function sendMessage() {
             const { value, done } = await reader.read();
             if (done) break;
             buf += decoder.decode(value, { stream: true });
-            const parts = buf.split('\n\n');
-            buf = parts.pop(); // 最后一段可能不完整
 
-            for (const part of parts) {
-                if (!part.startsWith('data:')) continue;
-                const raw = part.slice(5).trim();
-                if (!raw) continue;
+            const frames = buf.split('\n\n');
+            buf = frames.pop(); // 最后一段可能不完整
 
-                let evt;
-                try { evt = JSON.parse(raw); }
-                catch (_) { continue; }
+            for (const frame of frames) {
+                const parsed = parseSSEFrame(frame);
+                if (!parsed) continue;
+                const { event, data } = parsed;
 
-                switch (evt.type) {
+                switch (event) {
                     case 'thinking':
                         if (!hasTextStarted) showThinking(asstBubble);
                         break;
 
-                    case 'text':
+                    case 'chunk': {
                         if (!hasTextStarted) {
                             hideThinking(asstBubble);
                             hasTextStarted = true;
                         }
-                        asstText += (evt.content || '');
-                        // 流式期间先纯文本追加，避免 markdown 半截解析
+                        asstText += (data.text || '');
                         asstContent.textContent = asstText;
                         scrollToBottom();
                         break;
+                    }
 
                     case 'tool_call': {
-                        // 当前 assistant 气泡若是空（仅有 thinking 或没内容），就先移除，避免一个空气泡卡在工具之前
-                        if (!asstText) {
-                            asstBubble.remove();
-                        } else {
-                            // 已经有文本，先把它固化（markdown 渲染）
+                        // 如当前气泡已有文本则固化 markdown；否则移除空气泡
+                        if (asstText) {
                             asstContent.innerHTML = renderMarkdown(asstText);
+                        } else {
+                            asstBubble.remove();
                         }
-                        // 工具气泡插入到消息流
-                        const tb = appendToolBubble(evt);
-                        toolMap.set(evt.name, tb);
-                        // 为工具之后可能的 assistant 输出新建一个空气泡
+                        const tb = appendToolBubble(data);
+                        toolMap.set(data.name, tb);
+                        // 为工具后续可能的 assistant 输出新建空气泡
                         ({ bubble: asstBubble, contentEl: asstContent } = appendAssistantBubble());
                         asstText = '';
                         hasTextStarted = false;
@@ -261,20 +251,22 @@ async function sendMessage() {
                     }
 
                     case 'tool_result': {
-                        const tb = toolMap.get(evt.name);
-                        if (tb) updateToolBubble(tb, evt);
+                        const tb = toolMap.get(data.name);
+                        if (tb) updateToolBubble(tb, data);
                         scrollToBottom();
                         break;
                     }
 
-                    case 'retry':
-                        appendInfoBubble(`⏳ 限流重试 ${evt.attempt}/${evt.max_attempts}（等待 ${evt.wait_seconds?.toFixed?.(1) || evt.wait_seconds}s）`);
+                    case 'retry': {
+                        const secs = (data.wait_seconds || 0).toFixed ? data.wait_seconds.toFixed(1) : data.wait_seconds;
+                        appendInfoBubble(`⏳ 限流重试 ${data.attempt}/${data.max_attempts}（等待 ${secs}s）`);
                         scrollToBottom();
                         break;
+                    }
 
                     case 'error':
                         hideThinking(asstBubble);
-                        asstContent.textContent = `❌ ${evt.message || '未知错误'}`;
+                        asstContent.textContent = `❌ ${data.message || '未知错误'}`;
                         break outer;
 
                     case 'done':
@@ -283,60 +275,71 @@ async function sendMessage() {
             }
         }
 
-        // 流结束，对最终 assistant 文本做一次 markdown 重渲染
+        // 流结束，最终文本走一次 markdown 渲染
         if (asstText) {
             asstContent.innerHTML = renderMarkdown(asstText);
         } else if (!hasTextStarted) {
-            // 没有任何文本产出（比如全是工具调用最后没接话），把空气泡移除
             asstBubble.remove();
-        }
-
-        // 更新会话标题（如果是第一条消息）
-        const msgs = document.querySelectorAll('.message');
-        if (msgs.length <= 3) {
-            const title = message.slice(0, 20) + (message.length > 20 ? '...' : '');
-            sessions = sessions.map(s =>
-                s.session_id === currentSessionId ? { ...s, title } : s
-            );
-            renderSessionList();
-            document.getElementById('sessionTitle').textContent = title;
         }
     } catch (err) {
         if (asstContent && !asstContent.textContent) {
-            asstContent.textContent = `❌ 连接失败: ${err.message}`;
+            hideThinking(asstBubble);
+            asstContent.textContent = `❌ 连接异常: ${err.message}`;
         }
+    } finally {
+        btn.disabled = false;
+        scrollToBottom();
     }
-
-    btn.disabled = false;
-    scrollToBottom();
 }
 
-// ─── 气泡构造/操作 ───
+// ─── SSE 帧解析 ───
+function parseSSEFrame(frame) {
+    let event = 'message';
+    let data = '';
+    for (const line of frame.split('\n')) {
+        if (line.startsWith('event:')) {
+            event = line.slice(6).trim();
+        } else if (line.startsWith('data:')) {
+            data += line.slice(5).trim();
+        }
+    }
+    if (!data && event === 'message') return null;
+    let parsed = {};
+    try { parsed = data ? JSON.parse(data) : {}; } catch (_) { parsed = { raw: data }; }
+    return { event, data: parsed };
+}
 
+// ─── 气泡构造 ───
 function appendAssistantBubble() {
     const container = document.getElementById('chatContainer');
     const wrap = document.createElement('div');
     wrap.className = 'message assistant';
     wrap.innerHTML = '<div class="role">🤖 Agent</div><div class="content"></div>';
     container.appendChild(wrap);
-    const contentEl = wrap.querySelector('.content');
-    return { bubble: wrap, contentEl };
+    return { bubble: wrap, contentEl: wrap.querySelector('.content') };
+}
+
+function appendMessage(role, content) {
+    const container = document.getElementById('chatContainer');
+    const wrap = document.createElement('div');
+    wrap.className = `message ${role}`;
+    wrap.innerHTML = `
+        <div class="role">${role === 'user' ? '👤 你' : '🤖 Agent'}</div>
+        <div class="content"></div>`;
+    wrap.querySelector('.content').innerHTML = renderMarkdown(content);
+    container.appendChild(wrap);
 }
 
 function showThinking(bubble) {
     const content = bubble.querySelector('.content');
-    if (!content) return;
-    if (content.querySelector('.thinking-dots')) return;
+    if (!content || content.querySelector('.thinking-dots')) return;
     content.innerHTML = '<span class="thinking-dots"><span class="dot">.</span><span class="dot">.</span><span class="dot">.</span></span>';
 }
 
 function hideThinking(bubble) {
     const content = bubble.querySelector('.content');
     if (!content) return;
-    const dots = content.querySelector('.thinking-dots');
-    if (dots) {
-        content.innerHTML = '';
-    }
+    if (content.querySelector('.thinking-dots')) content.innerHTML = '';
 }
 
 function appendToolBubble(evt) {
@@ -346,10 +349,13 @@ function appendToolBubble(evt) {
     wrap.innerHTML = `
         <span class="tool-spinner"></span>
         <span class="tool-display">${escapeHtml(evt.display || evt.name || '调用工具中...')}</span>
-        <span class="tool-duration"></span>
-    `;
+        <span class="tool-duration"></span>`;
     container.appendChild(wrap);
-    return { bubble: wrap, contentEl: wrap.querySelector('.tool-display'), durEl: wrap.querySelector('.tool-duration') };
+    return {
+        bubble: wrap,
+        contentEl: wrap.querySelector('.tool-display'),
+        durEl: wrap.querySelector('.tool-duration'),
+    };
 }
 
 function updateToolBubble(tb, evt) {
@@ -368,6 +374,7 @@ function appendInfoBubble(text) {
     container.appendChild(wrap);
 }
 
+// ─── 渲染辅助 ───
 function renderMarkdown(text) {
     let html = escapeHtml(text);
     html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
@@ -375,26 +382,10 @@ function renderMarkdown(text) {
     return html;
 }
 
-function appendMessage(role, content) {
-    const container = document.getElementById('chatContainer');
-    container.insertAdjacentHTML('beforeend', renderMessage(role, content));
-}
-
-function showLoading() {
-    const id = 'loading_' + Date.now();
-    const container = document.getElementById('chatContainer');
-    container.insertAdjacentHTML('beforeend', `
-        <div class="message assistant" id="${id}">
-            <div class="role">🤖 Agent</div>
-            <div class="content loading"><span class="dot">.</span><span class="dot">.</span><span class="dot">.</span></div>
-        </div>`);
-    scrollToBottom();
-    return id;
-}
-
-function removeLoading(id) {
-    const el = document.getElementById(id);
-    if (el) el.remove();
+function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str || '';
+    return div.innerHTML;
 }
 
 function scrollToBottom() {
@@ -402,20 +393,18 @@ function scrollToBottom() {
     container.scrollTop = container.scrollHeight;
 }
 
-// ─── 工具函数 ───
-function escapeHtml(str) {
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
-}
-
+// ─── 输入区交互 ───
 function handleKeyDown(e) {
     if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         sendMessage();
+    } else {
+        setTimeout(() => autoResize(e.target), 0);
     }
 }
 
-function switchModel() {
-    // TODO: 切换模型
+function autoResize(el) {
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 120) + 'px';
 }
