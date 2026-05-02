@@ -544,9 +544,43 @@ class Memory:
         self.conn.execute(f"DELETE FROM sessions WHERE session_id = {ph}", (session_id,))
         self.conn.commit()
 
+    def clear_session_messages(self, session_id: str):
+        """清空 session 的消息/摘要/索引/快照，但保留 sessions 行，使 session_id 继续可用"""
+        user_id = self.get_user_id(session_id)
+        ph = self._ph
+        now = time.time()
+        self.conn.execute(f"DELETE FROM message_index WHERE session_id = {ph} AND user_id = {ph}", (session_id, user_id))
+        self.conn.execute(f"DELETE FROM keyword_index WHERE session_id = {ph} AND user_id = {ph}", (session_id, user_id))
+        self.conn.execute(f"DELETE FROM messages WHERE session_id = {ph} AND user_id = {ph}", (session_id, user_id))
+        self.conn.execute(f"DELETE FROM summaries WHERE session_id = {ph} AND user_id = {ph}", (session_id, user_id))
+        self.conn.execute(f"DELETE FROM context_snapshots WHERE session_id = {ph}", (session_id,))
+        self.conn.execute(f"UPDATE sessions SET updated_at = {ph} WHERE session_id = {ph}", (now, session_id))
+        self.conn.commit()
+
+    def session_owner(self, session_id: str) -> Optional[str]:
+        """返回该 session_id 的 user_id；不存在则 None"""
+        ph = self._ph
+        row = self.conn.execute(
+            f"SELECT user_id FROM sessions WHERE session_id = {ph}",
+            (session_id,)
+        ).fetchone()
+        return row[0] if row else None
+
     def list_sessions(self) -> List[Dict]:
         rows = self.conn.execute(
             "SELECT session_id, created_at, updated_at FROM sessions ORDER BY updated_at DESC"
+        ).fetchall()
+        return [
+            {"session_id": r[0], "created_at": r[1], "updated_at": r[2]}
+            for r in rows
+        ]
+
+    def list_sessions_by_user(self, user_id: str) -> List[Dict]:
+        """按 updated_at 倒序列出该用户的所有 session"""
+        ph = self._ph
+        rows = self.conn.execute(
+            f"SELECT session_id, created_at, updated_at FROM sessions WHERE user_id = {ph} ORDER BY updated_at DESC",
+            (user_id,)
         ).fetchall()
         return [
             {"session_id": r[0], "created_at": r[1], "updated_at": r[2]}
@@ -591,3 +625,6 @@ class Memory:
 
     async def aload_context(self, session_id: str) -> List[Dict]:
         return await asyncio.to_thread(self.load_context, session_id)
+
+    async def aclear_session_messages(self, session_id: str):
+        await asyncio.to_thread(self.clear_session_messages, session_id)

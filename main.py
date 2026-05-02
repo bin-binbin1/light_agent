@@ -101,7 +101,7 @@ async def _chat_loop(agent: Agent, config: Config):
                 continue
             if cmd == "/reset":
                 agent.reset()
-                print(_color(f"🔄 对话已重置  new session = {agent.session_id}", C_GREEN))
+                print(_color(f"🔄 新建会话（旧历史保留）  new session = {agent.session_id}", C_GREEN))
                 continue
             if cmd == "/history":
                 history = agent.get_history()

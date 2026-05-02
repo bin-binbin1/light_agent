@@ -214,16 +214,36 @@ class Agent:
 
     # ─── 会话管理 ───
 
-    def reset(self):
-        """重置对话：清空上下文，新建 session"""
+    def reset(self) -> str:
+        """切换到新 session；旧 session 的所有数据保留在数据库，随时可继续对话。
+
+        返回新的 session_id。
+        """
+        # 把当前内存上下文快照落到旧 session，避免 _context 里的未落盘消息丢失
+        if self._context:
+            try:
+                self.memory.save_context(self.session_id, self._context)
+            except Exception as e:
+                self.logger.error(f"save_context on reset failed: {e}")
         if self._compress_task and not self._compress_task.done():
             self._compress_task.cancel()
+        new_sid = f"{self.config.user_id}_{str(uuid.uuid4())[:8]}"
+        self.memory.create_session(new_sid, self.config.context_window, self.config.user_id)
+        self.session_id = new_sid
         self._context = []
+        self._compress_task = None
+        self.logger.system(f"新建 session={new_sid}（旧会话数据保留）")
+        return new_sid
+
+    def clear_history(self) -> None:
+        """清空当前 session 的消息/摘要/索引/快照，session_id 本身保留可继续使用。"""
+        if self._compress_task and not self._compress_task.done():
+            self._compress_task.cancel()
+            self._compress_task = None
+        self.memory.clear_session_messages(self.session_id)
         self.memory.delete_context_snapshot(self.session_id)
-        self.memory.clear_session(self.session_id)
-        self.session_id = f"{self.config.user_id}_{str(uuid.uuid4())[:8]}"
-        self.memory.create_session(self.session_id, self.config.context_window, self.config.user_id)
-        self.logger.system(f"对话已重置, 新 session={self.session_id}")
+        self._context = []
+        self.logger.system(f"会话历史已清空: session={self.session_id}")
 
     def get_history(self) -> List[Dict]:
         """获取对话历史（全量，从数据库）"""
