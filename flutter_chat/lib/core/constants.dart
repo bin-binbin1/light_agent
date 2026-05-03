@@ -3,7 +3,10 @@
 // - Android 模拟器:            http://10.0.2.2:8000
 // - Android 真机:              http://<电脑局域网 IP>:8000
 // - Web (CORS 已开):          http://localhost:8000
-const String baseUrl = 'http://localhost:8000';
+const baseUrl = String.fromEnvironment(
+  'BASE_URL',
+  defaultValue: 'http://localhost:8000',  // 开发默认值
+);
 
 // SharedPreferences Keys
 class StorageKeys {
