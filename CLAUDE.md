@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Light Agent 是一个轻量级 Python Agent 框架，面向超长对话场景。**核心原则：零向量数据库、零重型框架**——依赖仅 `requests` / `httpx` / `fastapi` / `uvicorn` / `python-dotenv`，其余都走标准库。修改时应优先保持这种轻量性，新增依赖前需谨慎评估。
 
+仓库自带两个客户端：
+- **Web UI**：`web/` 目录，原生 JS + SSE，服务端通过 `/agent/index` + `/agent/static/*` 直接挂载
+- **Flutter 客户端**：`flutter_chat/`，Android + Windows + Web 三端，详见 `flutter_chat/CLAUDE.md`。**改服务端协议前务必同步这两个客户端**——Web 端在 `web/app.js`，Flutter 端在 `flutter_chat/lib/core/api/` 和 `flutter_chat/lib/features/*/`
+
 ## 常用命令
 
 ```bash
@@ -47,7 +51,7 @@ python tests/test_memory.py                            # 测试脚本内部有 s
 
 ### 1. `Config.create_agent_from_config()` 是唯一规范的 Agent 创建入口
 
-`src/config.py:188-276` 实现，`main.py:182` 和 `server/app.py:141` 都调用它。以前散落在 main.py 的 80 多行装配逻辑（check_config / resolve_api_key / create_agent）都已收敛到这里。新写入口点（server、CLI、库使用）**都应走这个方法**，不要重新散装 LLM + Memory + AgentConfig。
+`src/config.py` 里实现，`main.py` 和 `server/app.py._create_agent_sync` 都调用它。以前散落在 main.py 的 80 多行装配逻辑（check_config / resolve_api_key / create_agent）都已收敛到这里。新写入口点（server、CLI、库使用）**都应走这个方法**，不要重新散装 LLM + Memory + AgentConfig。
 
 内部路由规则：
 - `config.base_url` 非空 **或** `provider` 不在 `LLMFactory.PROVIDERS` 里 → 直接构造 `OpenAICompatibleLLM`（自建代理、中转站、Ollama、vLLM 走这条）
@@ -85,12 +89,15 @@ python tests/test_memory.py                            # 测试脚本内部有 s
 - `SessionManager`（`src/session.py`）管理 `users` + `sessions` 表
 - `Memory` 的所有 SQL 都同时过滤 `session_id` AND `user_id`，**即便 session_id 全局唯一也不简化**——防御性设计
 
-服务端的 Agent 池（`server/app.py:79-191`）是另一层：
+服务端的 Agent 池（`server/app.py`）是另一层：
 
-- `_agent_pool: dict[username, Agent]` 按用户名一一对应，每个用户一个常驻 Agent（session 由 `create_agent_from_config(resume=True)` 自动恢复最近一条）
-- `_agent_locks[username]` 确保同一用户的 chat / reset / logout 串行执行
-- `_cleanup_idle_agents()` 后台每 300s 扫一次，闲置超 `LIGHT_AGENT_IDLE_TIMEOUT`（默认 1800s）的 Agent 被驱逐并 `save_state()`
-- `--workers >1` 时每个 worker 独立维护 `_agent_pool`，反向代理必须按 token/username 做 sticky routing，否则用户会在 worker 间跳跃丢 Agent 状态
+- `_agent_pool: dict[(username, session_id), Agent]` —— **按 `(用户, 会话)` 二元组索引**，同一用户可以同时挂多个会话 Agent（支持 Flutter 客户端的侧栏并发切换）。`server/app.py:79-83` 注释里明说了这点
+- `_agent_locks[(username, session_id)]` 确保同一 `(用户,会话)` 的 chat / reset / clear 串行；同一用户不同会话并不互斥
+- 新建：`/agent/chat` 命中空池时 `_aget_or_create_agent` 创建；`/agent/reset` 显式造新 session 的 Agent
+- 回收：`/agent/logout` 清该用户名下所有 `(user,*)` key；`/agent/session/delete` 清对应 key；`_cleanup_idle_agents()` 后台每 300s 扫一次，`_last_active` 超 `LIGHT_AGENT_IDLE_TIMEOUT`（默认 1800s）的 Agent 被 `_remove_agent_locked` 驱逐并 `save_state()`
+- `--workers >1` 时每个 worker 独立维护 `_agent_pool`，反向代理必须按 `username`（不是 session_id）做 sticky routing，否则同一用户在不同 worker 重复造 Agent，并发写同一 session 会乱序
+
+归属校验：凡是接收 `session_id` 的接口都先过 `_check_session_ownership`——空串→400、不存在→404、跨用户→403。已经在 `_agent_pool` 的 key 视作归属 OK，省一次 DB 查询。
 
 ### 6. SQL 方言抽象（sqlite / mysql）
 
@@ -109,12 +116,19 @@ python tests/test_memory.py                            # 测试脚本内部有 s
 
 ### 8. 服务端（FastAPI + SSE）
 
-`server/app.py` 是单一 FastAPI 应用，路由组仅 `/agent/*`：
+`server/app.py` 是单一 FastAPI 应用，路由组绝大多数走 `/agent/*`：
 
-- **认证**：`POST /agent/login` 接收 `{username}`，写入 `data/users.db` 的 `users` + `tokens` 表，返回 sha256 token（TTL 默认 7 天，可用 `LIGHT_AGENT_TOKEN_TTL` 覆盖）。后续接口通过 `?token=...` query param + `get_current_user` Depends 校验
-- **对话**：`POST /agent/chat` 返回 SSE 流（`text/event-stream`），`AgentEvent` 子类序列化成 `event: <type>\ndata: <json>`，文本 chunk 包成 `event: chunk`，结束发 `event: done`。**SSE 不走统一 `{code,msg,data}` 包装**，其他 JSON 端点都走
-- **其他**：`/agent/reset` 新 session、`/agent/session` 当前会话 id、`/agent/history` 历史、`/agent/reload` 开发用（清空 pool 强制重建以读取 config 热更新）
-- **静态**：`/agent/index` 返回 `web/index.html`，`/agent/static/*` 挂 `web/` 目录
+- **认证**：`POST /agent/login` 接收 `{username}`，写入 `data/users.db` 的 `users` + `tokens` 表，返回 sha256 token（TTL 默认 7 天，可用 `LIGHT_AGENT_TOKEN_TTL` 覆盖）。登录响应里顺带带上用户最近活跃的 `session_id`（没有就当场创建一个），客户端可直接用。`POST /agent/logout` 驱逐该用户名下所有 `(user,*)` Agent 并删所有 token。后续接口通过 `?token=...` query param + `get_current_user` Depends 校验
+- **对话**：`POST /agent/chat` 入参 `{message, session_id}`，返回 SSE 流（`text/event-stream`）。`AgentEvent` 子类序列化成 `event: <type>\ndata: <json>`，文本 chunk 包成 `event: chunk\ndata: {"text": "..."}`，结束发 `event: done\ndata: {}`。**SSE 不走统一 `{code,msg,data}` 包装**，其他 JSON 端点都走。给 LLM 的用户消息会自动加 `[发送时间: YYYY-MM-DD HH:MM:SS]\n` 前缀——客户端别重复加
+- **会话管理**：
+    - `POST /agent/reset` —— 新开一个 session 的 Agent（旧 session 数据保留），响应里的 `session_id` **必然是新的**
+    - `POST /agent/clear` —— 清指定 session 的历史消息（session_id 仍可用）
+    - `POST /agent/session/delete` —— 彻底删除 session（历史 + context snapshot），Agent 池里对应 key 也驱逐
+    - `GET  /agent/session?session_id=...` —— 不传 `session_id` 返回最近一条，传了则校验归属
+    - `GET  /agent/sessions` —— 列出当前用户所有 session（`session_id / created_at / updated_at`，**不带 title**，UI 侧自取 `/agent/history` 第一条 user 消息做标题）
+    - `GET  /agent/history?session_id=...` —— 指定会话的历史消息
+- **开发/运维**：`POST /agent/reload` 清空 agent pool 触发下次请求按最新 config 重建；`GET /health` 返回 `{"status":"ok","users_online":...}`（这个在 `/agent/*` 之外）
+- **静态**：`GET /agent/index` 返回 `web/index.html`，`/agent/static/*` 挂 `web/` 目录
 - **全局异常处理器**把 `HTTPException` / `RequestValidationError` / 未捕获 `Exception` 统一包成 `{code,msg,data}` JSON
 
 `server/run.py` 是 uvicorn 启动器（argparse 包装），读取 `server.app:app` 入口。
@@ -129,9 +143,9 @@ python tests/test_memory.py                            # 测试脚本内部有 s
 
 ### 10. 事件流
 
-`src/events.py` 的 `AgentEvent` 子类通过 `achat_stream` yield 给消费者：`ThinkingEvent` / `ToolCallEvent` / `ToolResultEvent` / `RetryEvent` / `ErrorEvent`。
+`src/events.py` 的 `AgentEvent` 子类通过 `achat_stream` yield 给消费者：`ThinkingEvent` / `ToolCallEvent` / `ToolResultEvent` / `RetryEvent` / `ErrorEvent`。**注意 `chunk`（纯文本增量）和 `done`（结束标记）不是 `AgentEvent`**——前者由 `achat_stream` 直接 yield 字符串，后者在服务端 `event_stream()` 里手动发。
 
-工具的 `display_calling` / `display_done` / `display_failed` 文案**和内部 `name` 分离**——日志打印 `name`（调试用），用户看 `display`（产品语言）。`main.py:124-152` 的循环示范了事件消费模式，`server/app.py:337-348` 演示 SSE 打包。
+工具的 `display_calling` / `display_done` / `display_failed` 文案**和内部 `name` 分离**——日志打印 `name`（调试用），用户看 `display`（产品语言）。`main.py` 的消费循环示范了终端渲染，`server/app.py` 的 `event_stream()` 示范了 SSE 打包（`dataclasses.asdict(chunk)` → `event: <type>\ndata: <json>`）。
 
 ## 常见坑
 
@@ -143,3 +157,5 @@ python tests/test_memory.py                            # 测试脚本内部有 s
 - **Windows 下 `readline`** 靠 `requirements.txt` 里的 `pyreadline3`（已用 `sys_platform == "win32"` 标记）。纯净解释器不装直接跑 `main.py` 会 ImportError
 - **`config/config.json` 未被 `.gitignore` 排除**：如果主动往里写 `api_key` 会被提交 git。推荐走 `.env` 路径
 - **`tests/conftest.py` 把 `/tmp/xxx` 重写到系统 tempdir**：所以测试代码里写 `"/tmp/test_memory.db"` 在 Windows 也能跑；**这是测试兼容层，生产路径里别出现 `/tmp/`**
+- **改服务端协议要同步两个客户端**：`web/app.js`（JS 原生）和 `flutter_chat/lib/core/api/*`（Dart + dio/SSE）。字段改名、事件新增、错误码变化都得对齐，否则旧客户端会静默失败或显示脏数据
+- **`/health` 不在 `/agent/*` 路由组**：反向代理做 `/agent/*` 前缀匹配时注意放行 `/health`，或者把健康检查改走 `/agent/health`（代码里可以加 alias）
