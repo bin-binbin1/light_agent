@@ -202,9 +202,13 @@ class Config:
 
         Raises:
             RuntimeError: model 或 api_key 缺失
+
+        Returns:
+            Agent，若 config 中配置了 tts_model，则 agent.tts 会自动创建
+            （xiaomi provider 用 XiaomiTTS，其余用 OpenAITTS）；否则 agent.tts = None
         """
         # 延迟导入，避免循环依赖 & 让 Config 在不需要 Agent 时也能用
-        from .llm import LLMFactory, OpenAICompatibleLLM, LLMType
+        from .llm import LLMFactory, OpenAICompatibleLLM, LLMType, OpenAITTS, XiaomiTTS
         from .agent import Agent, AgentConfig
         from .memory import Memory, MemoryConfig
         from .tools import create_default_tools
@@ -273,7 +277,31 @@ class Config:
         if tools is None:
             tools = create_default_tools()
 
-        return Agent(llm=llm, config=agent_config, tools=tools, logger=logger)
+        agent = Agent(llm=llm, config=agent_config, tools=tools, logger=logger)
+
+        # —— 可选 TTS：配了 tts_model 才创建 ——
+        tts_model = self.get("tts_model", "")
+        if tts_model:
+            tts_base_url = self.base_url or "https://api.openai.com/v1"
+            if self.provider == "xiaomi":
+                agent.tts = XiaomiTTS(
+                    api_key=api_key,
+                    base_url=tts_base_url,
+                    model=tts_model,
+                    voice=self.get("tts_voice", "mimo_default"),
+                    audio_format=self.get("tts_format", "wav"),
+                )
+            else:
+                agent.tts = OpenAITTS(
+                    api_key=api_key,
+                    base_url=tts_base_url,
+                    model=tts_model,
+                    voice=self.get("tts_voice", "alloy"),
+                )
+        else:
+            agent.tts = None
+
+        return agent
 
 
 def config_cli():
