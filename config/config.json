@@ -18,5 +18,6 @@
     "debug": true,
     "colorize": true,
     "user_id": "947221305d97d044523ae34e3e801f15",
-    "dialect": "sqlite"
+    "dialect": "sqlite",
+    "drop_leading_think":true
 }

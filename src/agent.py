@@ -4,10 +4,26 @@ Agent 模块 - 对话管理核心
 """
 
 import json
+import re
 import asyncio
 import uuid
 from typing import List, Dict, Optional, Any, AsyncGenerator, Union
 from dataclasses import dataclass, field
+
+
+# 仅匹配开头的 <think>...</think>（允许前置空白；DOTALL 让 . 匹配换行）
+_LEADING_THINK_RE = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+
+
+def strip_leading_think(text: str) -> str:
+    """剥离消息开头的 <think>...</think> 块；中间出现的不处理。
+
+    用于把存进 _context 的 assistant 内容裁掉思考块，下一轮 LLM 历史更干净；
+    日志输出仍用原始文本，避免丢失调试信息。
+    """
+    if not text:
+        return text
+    return _LEADING_THINK_RE.sub("", text, count=1)
 
 from .llm import BaseLLM, Message, LLMResponse
 from .memory import Memory, MemoryConfig
@@ -32,6 +48,48 @@ class AgentConfig:
     debug: bool = False
     user_id: str = "default_user"
     session_id: str = ""
+    drop_leading_think: bool = False
+
+    # 由 from_config 自动从 Config 透传的字段名 → (默认值, 类型转换)
+    # 新增"运行期可调"字段时只在这里加一行即可，不必再去 config.py / xiaoai_agent.py 各加一遍
+    _CONFIG_FIELDS = (
+        # (字段名,            默认值,               转换器)
+        ("name",               "assistant",         str),
+        ("system_prompt",      "你是一个有用的 AI 助手。", str),
+        ("context_window",     128000,              int),
+        ("temperature",        0.7,                 float),
+        ("max_tokens",         4096,                int),
+        ("debug",              False,               bool),
+        ("drop_leading_think", False,               bool),
+    )
+
+    @classmethod
+    def from_config(cls, cfg, *,
+                    user_id: str = "",
+                    session_id: str = "",
+                    memory_config: Optional[MemoryConfig] = None) -> "AgentConfig":
+        """从一个 Config（或任何带 .get(key, default) 的对象）装配 AgentConfig。
+
+        新增运行期字段时，只需要：
+          1. 在 AgentConfig 上加 dataclass 字段（带默认值）
+          2. 在 _CONFIG_FIELDS 元组里加一行
+        无需再去 create_agent_from_config / xiaoai_agent.py 等装配点改透传。
+
+        Args:
+            cfg: Config 实例或任何鸭子类型（需有 get(key, default) 方法）
+            user_id: 覆盖 cfg 的 user_id；空串则回退 cfg.get("user_id")
+            session_id: 显式指定 session_id
+            memory_config: 由调用方组装好的 MemoryConfig（None 则用 dataclass 默认）
+        """
+        kwargs = {
+            name: conv(cfg.get(name, default))
+            for name, default, conv in cls._CONFIG_FIELDS
+        }
+        kwargs["user_id"] = user_id or cfg.get("user_id", "default_user")
+        kwargs["session_id"] = session_id
+        if memory_config is not None:
+            kwargs["memory_config"] = memory_config
+        return cls(**kwargs)
 
 
 class Agent:
@@ -134,6 +192,21 @@ class Agent:
         """从 SQLite 加载上下文到内存"""
         self._context = self.memory.load_context(self.session_id)
 
+    def inject_memory(self, messages: List[Dict], mode: str = "append"):
+        """将外部消息注入到 agent 上下文（写入 DB + 更新内存）。
+
+        Args:
+            messages: 消息列表，每条需有 role/content，可选 tool_calls / tool_call_id
+            mode: "append" 追加, "replace" 清空后替换
+        """
+        self._context = self.memory.inject_messages(self.session_id, messages, mode)
+        self.logger.system(f"外部 memory 已注入: mode={mode}, 共 {len(messages)} 条")
+
+    async def ainject_memory(self, messages: List[Dict], mode: str = "append"):
+        """异步版本的外部 memory 注入"""
+        self._context = await self.memory.ainject_messages(self.session_id, messages, mode)
+        self.logger.system(f"外部 memory 已注入: mode={mode}, 共 {len(messages)} 条")
+
     # ─── 同步对话 ───
 
     def chat(self, user_input: str) -> str:
@@ -163,9 +236,14 @@ class Agent:
             return self._handle_tool_calls(response)
 
         self.memory.add_message(self.session_id, "assistant", response.content)
-        self._append_context("assistant", response.content)
+        ctx_content = (
+            strip_leading_think(response.content)
+            if self.config.drop_leading_think else response.content
+        )
+        self._append_context("assistant", ctx_content)
         self.logger.response(response.content)
-        return response.content
+        # drop_leading_think 时返回值也剥离，调用方拿到干净文本
+        return ctx_content
 
     def _handle_tool_calls(self, response: LLMResponse) -> str:
         """处理工具调用循环"""
@@ -174,7 +252,11 @@ class Agent:
             for tc in response.tool_calls
         ]
         self.memory.add_message(self.session_id, "assistant", response.content or "", tool_calls=tc_dicts)
-        self._append_context("assistant", response.content or "", tool_calls=tc_dicts)
+        ctx_reason = (
+            strip_leading_think(response.content or "")
+            if self.config.drop_leading_think else (response.content or "")
+        )
+        self._append_context("assistant", ctx_reason, tool_calls=tc_dicts)
 
         if self.config.debug:
             self.logger.log(LogType.TOOL_CALL_REASON, f"tool_call_reason: {response.content}")
@@ -208,9 +290,13 @@ class Agent:
             return self._handle_tool_calls(final_response)
 
         self.memory.add_message(self.session_id, "assistant", final_response.content)
-        self._append_context("assistant", final_response.content)
+        ctx_final = (
+            strip_leading_think(final_response.content)
+            if self.config.drop_leading_think else final_response.content
+        )
+        self._append_context("assistant", ctx_final)
         self.logger.response(final_response.content)
-        return final_response.content
+        return ctx_final
 
     # ─── 会话管理 ───
 
@@ -295,6 +381,15 @@ class Agent:
                 accumulated_content += chunk
                 yield chunk
 
+        # 工具调用后的 LLM 错误检测（对齐同步版）
+        if tool_call_response and tool_call_response.raw and tool_call_response.raw.get("error"):
+            error_msg = tool_call_response.raw.get("error_message", "未知错误")
+            self.logger.error(f"工具调用后 LLM 返回错误: {error_msg}")
+            if self.config.debug:
+                error_detail = tool_call_response.raw.get("error_detail", "")
+                if error_detail:
+                    self.logger.error(f"详细错误: {error_detail}")
+
         if tool_call_response and tool_call_response.tool_calls:
             async for chunk in self._ahandle_tool_calls_stream(tool_call_response, tools):
                 yield chunk
@@ -334,6 +429,7 @@ class Agent:
             except Exception as e:
                 result = f"工具执行错误: {e}"
                 success = False
+                self.logger.error(f"工具 {tc.name} 执行异常: {e}")
             duration_ms = int((_time.time() - t0) * 1000)
 
             self.logger.tool_result(tc.name, result)

@@ -250,12 +250,10 @@ class Config:
             session_id = mem.get_latest_session(user_id) or ""
             mem.close()
 
-        agent_config = AgentConfig(
-            name=self.get("name", "assistant"),
-            system_prompt=self.get("system_prompt", "你是一个有用的 AI 助手。"),
-            context_window=self.context_window,
-            temperature=self.get("temperature", 0.7),
-            max_tokens=self.get("max_tokens", 4096),
+        agent_config = AgentConfig.from_config(
+            self,
+            user_id=user_id,
+            session_id=session_id,
             memory_config=MemoryConfig(
                 db_path=db_path,
                 compress_threshold=self.compress_threshold,
@@ -263,9 +261,6 @@ class Config:
                 idle_compress_hours=self.idle_compress_hours,
                 dialect=self.dialect,
             ),
-            debug=self.debug,
-            user_id=user_id,
-            session_id=session_id,
         )
 
         if logger is None:

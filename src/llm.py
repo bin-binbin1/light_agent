@@ -161,6 +161,8 @@ class OpenAICompatibleLLM(BaseLLM):
         super().__init__(api_key, model, base_url)
         self.vision_model = vision_model or model
         self._capabilities = capabilities or [LLMType.TEXT]
+        # 复用 TCP/TLS 连接：避免每次 chat 重新握手（线上跨网关时显著）
+        self._session = requests.Session()
 
     @property
     def capabilities(self) -> List[LLMType]:
@@ -195,13 +197,21 @@ class OpenAICompatibleLLM(BaseLLM):
         # 429 重试：最多 5 次，指数退避 + 抖动
         max_retries = 5
         response = None
+        url = f"{self.base_url}/chat/completions"
+        total_t0 = _time.time()
         for attempt in range(max_retries + 1):
             try:
-                response = requests.post(
-                    f"{self.base_url}/chat/completions",
+                req_t0 = _time.time()
+                response = self._session.post(
+                    url,
                     headers=headers,
                     json=payload,
                     timeout=120
+                )
+                req_ms = int((_time.time() - req_t0) * 1000)
+                # 单次请求耗时（不含等待重试），便于排查 provider 抖动
+                _logger.system(
+                    f"[llm] POST {url} → {response.status_code} in {req_ms}ms (attempt {attempt+1})"
                 )
                 if response.status_code == 429 and attempt < max_retries:
                     retry_after = response.headers.get("Retry-After")
@@ -212,15 +222,22 @@ class OpenAICompatibleLLM(BaseLLM):
                             wait = 2 ** attempt
                     else:
                         wait = (2 ** attempt) + random.uniform(0, 1)
-                    _logger.error(f"LLM 429 Too Many Requests (第 {attempt+1}/{max_retries} 次重试)，等待 {wait:.1f}s")
+                    _logger.error(
+                        f"LLM 429 Too Many Requests (第 {attempt+1}/{max_retries} 次重试)，等待 {wait:.1f}s"
+                    )
                     _time.sleep(wait)
                     continue
                 response.raise_for_status()
                 data = response.json()
+                total_ms = int((_time.time() - total_t0) * 1000)
+                if attempt > 0:
+                    _logger.system(f"[llm] chat success after {attempt+1} attempts, total={total_ms}ms")
                 return self._parse_response(data)
             except requests.exceptions.HTTPError as e:
                 break  # 非 429 错误直接跳出进入错误处理
             except requests.exceptions.RequestException as e:
+                req_ms = int((_time.time() - req_t0) * 1000)
+                _logger.error(f"[llm] 网络错误 after {req_ms}ms: {e}")
                 return LLMResponse(
                     content="",
                     raw={"error": True, "error_message": f"网络错误: {str(e)}"}

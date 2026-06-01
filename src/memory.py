@@ -596,6 +596,48 @@ class Memory:
         ).fetchone()
         return row[0] if row else None
 
+    # ─── 外部 Memory 注入 ───
+
+    def inject_messages(self, session_id: str, messages: List[Dict], mode: str = "append") -> List[Dict]:
+        """将外部消息注入到 session。
+
+        Args:
+            session_id: 目标会话
+            messages: 消息列表，每条 role/content 必填，可选 tool_calls / tool_call_id
+            mode: "append" 追加到现有上下文, "replace" 清空后替换
+
+        Returns:
+            注入后的完整上下文列表（可直接赋值给 Agent._context）
+        """
+        if mode == "replace":
+            self.clear_session_messages(session_id)
+            # 重建 session 行（clear_session_messages 会删 sessions 行）
+            user_id = self.get_user_id(session_id) if session_id in [
+                r[0] for r in self.conn.execute("SELECT session_id FROM sessions").fetchall()
+            ] else "default_user"
+            self.create_session(session_id, user_id=user_id)
+
+        for msg in messages:
+            self.add_message(
+                session_id,
+                role=msg.get("role", "user"),
+                content=msg.get("content", ""),
+                tool_calls=msg.get("tool_calls"),
+                tool_call_id=msg.get("tool_call_id"),
+            )
+
+        # replace 模式：上下文就是注入的消息；append 模式：加载现有上下文 + 注入的消息
+        if mode == "replace":
+            ctx = [
+                {"role": m.get("role", "user"), "content": m.get("content", ""),
+                 **({"tool_calls": m["tool_calls"]} if m.get("tool_calls") else {}),
+                 **({"tool_call_id": m["tool_call_id"]} if m.get("tool_call_id") else {})}
+                for m in messages
+            ]
+        else:
+            ctx = self.load_context(session_id)
+        return ctx
+
     def close(self):
         self.conn.close()
 
@@ -628,3 +670,6 @@ class Memory:
 
     async def aclear_session_messages(self, session_id: str):
         await asyncio.to_thread(self.clear_session_messages, session_id)
+
+    async def ainject_messages(self, session_id: str, messages: List[Dict], mode: str = "append") -> List[Dict]:
+        return await asyncio.to_thread(self.inject_messages, session_id, messages, mode)
